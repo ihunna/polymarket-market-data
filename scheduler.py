@@ -33,6 +33,19 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{mins:02d}:{secs:02d}"
 
+def format_dollar(price):
+    return f"${price:.2f}"
+
+def format_token_cents(raw):
+    if raw <= 0 or raw > 1.0:
+        return "0¢"
+    return f"{round(raw * 100)}¢"
+
+def format_lowest_cents(lowest_seen):
+    if lowest_seen != float('inf') and lowest_seen > 0:
+        return f"{round(lowest_seen * 100)}¢"
+    return "N/A"
+
 def update_window_progress(window_start, window_end, formatted_message):
     """Updates a single persistent line showing window progress and token ask data."""
     now = time.time()
@@ -53,7 +66,7 @@ def update_window_progress(window_start, window_end, formatted_message):
     sys.stdout.flush()
 
 def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, outcome):
-    """Appends window results including price-to-beat, final Polymarket price, and extremes to CSV."""
+    """Appends window results with formatted coin prices and lowest token ask extremes."""
     filename = f"{COIN_NAME}-{DURATION_MINUTES}-updown.csv"
     file_exists = os.path.isfile(filename)
     
@@ -61,7 +74,14 @@ def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, ou
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(["Time stamp", "price_to_beat", "final_price", "lowest_up", "lowest_down", "outcome"])
-        writer.writerow([timestamp, price_to_beat, final_price, lowest_up, lowest_down, outcome])
+        writer.writerow([
+            timestamp,
+            format_dollar(price_to_beat),
+            format_dollar(final_price),
+            lowest_up,
+            lowest_down,
+            outcome,
+        ])
 
 # --- Single Global Permanent WebSocket Manager for Order Book Asks Only ---
 class PersistentPolymarketWS:
@@ -170,8 +190,8 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
     initialized = False
-    
-    print(f"📊 Price to Beat (Baseline): ${price_to_beat:.2f}")
+
+    print(f"📊 Price to Beat (Baseline): {format_dollar(price_to_beat)}")
 
     while True:
         current_time = time.time()
@@ -192,35 +212,36 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
             elif down_final >= 0.95 or (down_final > up_final and down_final > 0.5):
                 outcome = "Down"
                 
-            l_up_fmt = f"{round(lowest_up_seen * 100)}¢" if lowest_up_seen != float('inf') and lowest_up_seen > 0 else "N/A"
-            l_down_fmt = f"{round(lowest_down_seen * 100)}¢" if lowest_down_seen != float('inf') and lowest_down_seen > 0 else "N/A"
-            
+            l_up_fmt = format_lowest_cents(lowest_up_seen)
+            l_down_fmt = format_lowest_cents(lowest_down_seen)
+
             log_to_csv(window_start, price_to_beat, final_price, l_up_fmt, l_down_fmt, outcome)
-            
-            print(f"🏁 Window completed! Outcome: {outcome} | PTB: ${price_to_beat:.2f} | Final Price: ${final_price:.2f} | Logged")
+
+            print(
+                f"🏁 Window completed! Outcome: {outcome} | "
+                f"PTB: {format_dollar(price_to_beat)} | Final Price: {format_dollar(final_price)} | Logged"
+            )
             
             return final_price
         
         up_cost = ws_state["up_raw"]
         down_cost = ws_state["down_raw"]
-        
-        # Capture the baseline starting prices first once data is populated
+
         if not initialized and up_cost > 0 and down_cost > 0:
             lowest_up_seen = up_cost
             lowest_down_seen = down_cost
             initialized = True
 
-        # Track lowest extremes moving forward
         if initialized:
             if 0.0 < up_cost <= 1.0 and up_cost < lowest_up_seen:
                 lowest_up_seen = up_cost
             if 0.0 < down_cost <= 1.0 and down_cost < lowest_down_seen:
                 lowest_down_seen = down_cost
-            
-        up_cents = round(up_cost * 100) if up_cost <= 1.0 else 0
-        down_cents = round(down_cost * 100) if down_cost <= 1.0 else 0
-        
-        display_str = f"PTB: ${price_to_beat:.2f} | Up: {up_cents}¢ | Down: {down_cents}¢"
+
+        up_cents = format_token_cents(up_cost)
+        down_cents = format_token_cents(down_cost)
+
+        display_str = f"PTB: {format_dollar(price_to_beat)} | Up: {up_cents} | Down: {down_cents}"
         update_window_progress(window_start, window_end, formatted_message=display_str)
         
         time.sleep(0.5)

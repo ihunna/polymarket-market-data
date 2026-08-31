@@ -3,3 +3,5 @@ venv
 /venv
 proxies.txt
 solana-15-updown.csv
+__pycache__/
+*.pyc

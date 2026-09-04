@@ -6,11 +6,15 @@ from datetime import datetime, timezone
 
 import requests
 
-WINDOW_DURATION_SECONDS = 15 * 60
 PRICE_HISTORY_URL = "https://polymarket.com/api/crypto/price-history"
 PRICE_HISTORY_HEADERS = {
     "accept": "*/*",
     "user-agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36",
+}
+
+VARIANT_BY_MINUTES = {
+    5: "five",
+    15: "fifteen",
 }
 
 _token_cache = {}
@@ -18,15 +22,18 @@ _token_cache = {}
 def _epoch_to_iso(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _fetch_price_history(window_start_epoch: int, window_end_epoch: int):
+def _fetch_price_history(window_start_epoch: int, window_end_epoch: int, duration_minutes: int):
     """Returns price-history points for a window, or None on failure."""
+    variant = VARIANT_BY_MINUTES.get(duration_minutes)
+    if not variant:
+        return None
     try:
         resp = requests.get(
             PRICE_HISTORY_URL,
             params={
                 "symbol": "SOL",
                 "eventStartTime": _epoch_to_iso(window_start_epoch),
-                "variant": "fifteen",
+                "variant": variant,
                 "endDate": _epoch_to_iso(window_end_epoch),
                 "twapEnabled": "true",
                 "twapLookbackSeconds": "60",
@@ -43,14 +50,15 @@ def _fetch_price_history(window_start_epoch: int, window_end_epoch: int):
     except Exception:
         return None
 
-def fetch_polymarket_end_price(window_start_epoch: int) -> float:
-    """Fetches the TWAP end price for a completed 15-minute window."""
-    window_end_epoch = window_start_epoch + WINDOW_DURATION_SECONDS
+def fetch_polymarket_end_price(window_start_epoch: int, duration_minutes: int = 15) -> float:
+    """Fetches the TWAP end price for a completed window of the given duration."""
+    window_duration_seconds = duration_minutes * 60
+    window_end_epoch = window_start_epoch + window_duration_seconds
     window_end_ms = window_end_epoch * 1000
     latest_value = 0.0
 
     for attempt in range(6):
-        points = _fetch_price_history(window_start_epoch, window_end_epoch)
+        points = _fetch_price_history(window_start_epoch, window_end_epoch, duration_minutes)
         if points:
             last_point = points[-1]
             latest_value = float(last_point.get("value", 0.0))

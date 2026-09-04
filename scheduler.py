@@ -1,5 +1,6 @@
 # Save this file as: scheduler.py
 
+import argparse
 import os
 import sys
 import time
@@ -11,9 +12,12 @@ from datetime import datetime
 import websocket
 from polymarket_poller import fetch_polymarket_data, fetch_polymarket_end_price, get_market_metadata_for_slug
 
-WINDOW_DURATION_SECONDS = 15 * 60  # 15 minutes (900 seconds)
-COIN_NAME = "solana"               
+COIN_NAME = "solana"
+SUPPORTED_DURATIONS = (5, 15)
+
+# Set in main() from CLI / env
 DURATION_MINUTES = 15
+WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
 
 # Global shared state for order book token asks only
 ws_state = {
@@ -23,10 +27,10 @@ ws_state = {
 }
 
 def get_current_active_slug(coin="sol"):
-    """Computes the exact slug for the current live 15-minute window based on real-time epoch."""
+    """Computes the exact slug for the current live window based on real-time epoch."""
     now_utc = calendar.timegm(time.gmtime())
     window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
-    return f"{coin}-updown-15m-{window_start}"
+    return f"{coin}-updown-{DURATION_MINUTES}m-{window_start}"
 
 def format_time(seconds):
     mins = int(seconds // 60)
@@ -54,12 +58,13 @@ def update_window_progress(window_start, window_end, formatted_message):
     if remaining < 0:
         remaining = 0
 
-    progress = max(0.0, min(1.0, elapsed / WINDOW_DURATION_SECONDS))
+    duration = max(1, window_end - window_start)
+    progress = max(0.0, min(1.0, elapsed / duration))
     filled_blocks = int(progress * 20)
     bar = "█" * filled_blocks + "-" * (20 - filled_blocks)
     
     start_dt = datetime.fromtimestamp(window_start)
-    window_label = f"{start_dt.strftime('%H:%M')} window"
+    window_label = f"{DURATION_MINUTES}m {start_dt.strftime('%H:%M')} window"
     time_str = format_time(remaining)
     
     sys.stdout.write(f"\r{window_label} [{bar}] {time_str} remaining | {formatted_message}   ")
@@ -164,13 +169,13 @@ class PersistentPolymarketWS:
                 time.sleep(2)
 
 def run_high_frequency_loop(ws_manager, price_to_beat):
-    """Executes a 15-minute window loop tracking token asks and querying Polymarket only at the buzzer."""
+    """Executes a window loop tracking token asks and querying Polymarket only at the buzzer."""
     now_utc = calendar.timegm(time.gmtime())
     window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
     window_end = window_start + WINDOW_DURATION_SECONDS
     
     active_slug = get_current_active_slug(coin="sol")
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 Market window started! (Slug: {active_slug})")
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 {DURATION_MINUTES}m market window started! (Slug: {active_slug})")
     
     up_token, down_token, question = get_market_metadata_for_slug(active_slug)
     if not up_token or not down_token:
@@ -198,7 +203,7 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
         
         if current_time >= window_end:
             print("\n⏳ Window ended. Fetching end price from Polymarket...")
-            final_price = fetch_polymarket_end_price(window_start)
+            final_price = fetch_polymarket_end_price(window_start, duration_minutes=DURATION_MINUTES)
             if final_price == 0.0:
                 print("⚠️ Polymarket fetch failed, falling back to previous price-to-beat.")
                 final_price = price_to_beat
@@ -218,7 +223,7 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
             log_to_csv(window_start, price_to_beat, final_price, l_up_fmt, l_down_fmt, outcome)
 
             print(
-                f"🏁 Window completed! Outcome: {outcome} | "
+                f"🏁 {DURATION_MINUTES}m window completed! Outcome: {outcome} | "
                 f"PTB: {format_dollar(price_to_beat)} | Final Price: {format_dollar(final_price)} | Logged"
             )
             
@@ -248,7 +253,7 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
 
 def start_aligned_runner():
     """Initializes services and prompts for initial manual PTB."""
-    print("🔌 Initializing services...")
+    print(f"🔌 Initializing services... (window={DURATION_MINUTES}m)")
     global_ws_manager = PersistentPolymarketWS()
     
     while True:
@@ -266,5 +271,33 @@ def start_aligned_runner():
             print(f"\nError in loop execution: {e}. Restarting cycle...")
             time.sleep(2)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Polymarket SOL up/down window tracker")
+    parser.add_argument(
+        "-d", "--duration",
+        type=int,
+        choices=SUPPORTED_DURATIONS,
+        default=None,
+        help="Window duration in minutes (5 or 15). Default: 15, or WINDOW_DURATION_MINUTES env.",
+    )
+    return parser.parse_args()
+
+def resolve_duration(cli_duration):
+    if cli_duration is not None:
+        return cli_duration
+    env_val = os.environ.get("WINDOW_DURATION_MINUTES", "").strip()
+    if env_val:
+        try:
+            minutes = int(env_val)
+        except ValueError:
+            raise SystemExit(f"Invalid WINDOW_DURATION_MINUTES={env_val!r}; expected 5 or 15.")
+        if minutes not in SUPPORTED_DURATIONS:
+            raise SystemExit(f"Unsupported WINDOW_DURATION_MINUTES={minutes}; choose from {SUPPORTED_DURATIONS}.")
+        return minutes
+    return 15
+
 if __name__ == "__main__":
+    args = parse_args()
+    DURATION_MINUTES = resolve_duration(args.duration)
+    WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
     start_aligned_runner()

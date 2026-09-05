@@ -1,5 +1,3 @@
-# Save this file as: polymarket_poller.py
-
 import json
 import time
 from datetime import datetime, timezone
@@ -15,6 +13,7 @@ PRICE_HISTORY_HEADERS = {
 VARIANT_BY_MINUTES = {
     5: "five",
     15: "fifteen",
+    60: "hourly",
 }
 
 _token_cache = {}

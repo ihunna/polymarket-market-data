@@ -4,5 +4,6 @@ venv
 proxies.txt
 solana-15-updown.csv
 solana-5-updown.csv
+solana-60-updown.csv
 __pycache__/
 *.pyc

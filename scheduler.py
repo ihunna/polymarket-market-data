@@ -1,5 +1,3 @@
-# Save this file as: scheduler.py
-
 import argparse
 import os
 import sys
@@ -9,11 +7,12 @@ import json
 import calendar
 import threading
 from datetime import datetime
+import zoneinfo
 import websocket
 from polymarket_poller import fetch_polymarket_data, fetch_polymarket_end_price, get_market_metadata_for_slug
 
 COIN_NAME = "solana"
-SUPPORTED_DURATIONS = (5, 15)
+SUPPORTED_DURATIONS = (5, 15, 60)
 
 # Set in main() from CLI / env
 DURATION_MINUTES = 15
@@ -27,7 +26,21 @@ ws_state = {
 }
 
 def get_current_active_slug(coin="sol"):
-    """Computes the exact slug for the current live window based on real-time epoch."""
+    """Computes the exact slug for short-duration or hourly markets matching Polymarket's URL scheme."""
+    if DURATION_MINUTES == 60:
+        et_zone = zoneinfo.ZoneInfo("America/New_York")
+        now_et = datetime.now(et_zone)
+        
+        month_name = now_et.strftime("%B").lower()
+        day = now_et.strftime("%d").lstrip("0")
+        year = now_et.strftime("%Y")
+        
+        hour_12 = now_et.strftime("%I").lstrip("0")
+        ampm = now_et.strftime("%p").lower()
+        
+        full_coin_name = "solana" if coin == "sol" else coin
+        return f"{full_coin_name}-up-or-down-{month_name}-{day}-{year}-{hour_12}{ampm}-et"
+    
     now_utc = calendar.timegm(time.gmtime())
     window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
     return f"{coin}-updown-{DURATION_MINUTES}m-{window_start}"
@@ -169,10 +182,18 @@ class PersistentPolymarketWS:
                 time.sleep(2)
 
 def run_high_frequency_loop(ws_manager, price_to_beat):
-    """Executes a window loop tracking token asks and querying Polymarket only at the buzzer."""
+    """Executes a window loop tracking token asks and syncing window boundary to ET/UTC epoch."""
     now_utc = calendar.timegm(time.gmtime())
-    window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
-    window_end = window_start + WINDOW_DURATION_SECONDS
+    
+    if DURATION_MINUTES == 60:
+        et_zone = zoneinfo.ZoneInfo("America/New_York")
+        now_et = datetime.now(et_zone)
+        start_of_hour_et = now_et.replace(minute=0, second=0, microsecond=0)
+        window_start = int(start_of_hour_et.timestamp())
+        window_end = window_start + 3600
+    else:
+        window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
+        window_end = window_start + WINDOW_DURATION_SECONDS
     
     active_slug = get_current_active_slug(coin="sol")
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚀 {DURATION_MINUTES}m market window started! (Slug: {active_slug})")
@@ -278,7 +299,7 @@ def parse_args():
         type=int,
         choices=SUPPORTED_DURATIONS,
         default=None,
-        help="Window duration in minutes (5 or 15). Default: 15, or WINDOW_DURATION_MINUTES env.",
+        help="Window duration in minutes (5, 15, or 60). Default: 15.",
     )
     return parser.parse_args()
 
@@ -290,7 +311,7 @@ def resolve_duration(cli_duration):
         try:
             minutes = int(env_val)
         except ValueError:
-            raise SystemExit(f"Invalid WINDOW_DURATION_MINUTES={env_val!r}; expected 5 or 15.")
+            raise SystemExit(f"Invalid WINDOW_DURATION_MINUTES={env_val!r}; expected 5, 15, or 60.")
         if minutes not in SUPPORTED_DURATIONS:
             raise SystemExit(f"Unsupported WINDOW_DURATION_MINUTES={minutes}; choose from {SUPPORTED_DURATIONS}.")
         return minutes

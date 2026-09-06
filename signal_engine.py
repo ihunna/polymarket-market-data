@@ -66,6 +66,7 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
         "min_streak",
         "max_streak",
         "max_last_delta",
+        "use_total_move",
         "min_total_move",
         "max_total_move",
         "limit_cents",
@@ -219,6 +220,7 @@ class DualHedgeSimulator:
         self.min_streak = int(config["min_streak"])
         self.max_streak = int(config["max_streak"])
         self.max_last_delta = float(config["max_last_delta"])
+        self.use_total_move = bool(config["use_total_move"])
         self.min_total_move = float(config["min_total_move"])
         self.max_total_move = float(config["max_total_move"])
         self.limit_cents = int(config["limit_cents"])
@@ -396,7 +398,9 @@ class DualHedgeSimulator:
         if abs_delta > self.max_last_delta:
             result["reason"] = f"last>{self.max_last_delta}"
             return result
-        if total_move < self.min_total_move or total_move > self.max_total_move:
+        if self.use_total_move and (
+            total_move < self.min_total_move or total_move > self.max_total_move
+        ):
             result["reason"] = f"move not in [{self.min_total_move},{self.max_total_move}]"
             return result
         result["ok"] = True

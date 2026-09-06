@@ -17,6 +17,7 @@ limit_cents: 30                   # 40, 30, or 25
 min_streak: 3
 max_streak: 4
 max_last_delta: 0.15
+use_total_move: true              # false = ignore min/max_total_move filter
 min_total_move: 0.20
 max_total_move: 0.80
 

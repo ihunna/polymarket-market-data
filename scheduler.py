@@ -99,7 +99,9 @@ def update_window_progress(window_start, window_end, formatted_message):
     window_label = f"{DURATION_MINUTES}m {start_dt.strftime('%H:%M')} window"
     time_str = format_time(remaining)
     
-    sys.stdout.write(f"\r{window_label} [{bar}] {time_str} remaining | {formatted_message}   ")
+    # Pad to clear leftover chars from longer previous lines
+    line = f"{window_label} [{bar}] {time_str} remaining | {formatted_message}"
+    sys.stdout.write("\r" + line + " " * 12)
     sys.stdout.flush()
 
 def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, outcome):
@@ -339,7 +341,12 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
         up_cents = format_token_cents(up_cost)
         down_cents = format_token_cents(down_cost)
 
-        display_str = f"PTB: {format_dollar(price_to_beat)} | Up: {up_cents} | Down: {down_cents}"
+        sim_bit = ""
+        if simulator is not None:
+            sim_bit = f" | {simulator.display_status(window_start)}"
+        display_str = (
+            f"PTB: {format_dollar(price_to_beat)} | Up: {up_cents} | Down: {down_cents}{sim_bit}"
+        )
         update_window_progress(window_start, window_end, formatted_message=display_str)
         
         time.sleep(0.5)

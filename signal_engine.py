@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -240,6 +241,7 @@ class DualHedgeSimulator:
         self.open_trades: dict[int, OpenTrade] = {}  # target_window_start → trade
         self._decided_windows: set[int] = set()
         self._active_window_start: int | None = None
+        self.status_line = "sim: idle"
 
         self._seed_history_from_csv()
         self._ensure_trades_header()
@@ -329,15 +331,44 @@ class DualHedgeSimulator:
         if len(self.history) > HISTORY_LIMIT:
             self.history = self.history[-HISTORY_LIMIT:]
 
-    def _streak_metrics(
-        self, history: list[WindowRecord]
-    ) -> tuple[int, float, float, str] | None:
-        """Return (streak_len, abs_delta, total_move, direction) for trailing streak, or None."""
+    def _print_event(self, message: str) -> None:
+        """Print on its own line so it doesn't collide with the \\r progress bar."""
+        sys.stdout.write("\n" + message + "\n")
+        sys.stdout.flush()
+
+    def display_status(self, window_start: int | None = None) -> str:
+        """Short status fragment for the live progress line."""
+        if window_start is not None and window_start in self.open_trades:
+            trade = self.open_trades[window_start]
+            fills = []
+            if trade.up_filled:
+                fills.append("Up")
+            if trade.down_filled:
+                fills.append("Down")
+            fill_txt = "+".join(fills) if fills else "waiting"
+            return f"SIM open {trade.contracts}c @{trade.limit_cents}¢ [{fill_txt}]"
+        if self.status_line:
+            return self.status_line
+        return "sim: idle"
+
+    def _evaluate_setup(self, history: list[WindowRecord]) -> dict[str, Any]:
+        """
+        Evaluate trailing streak filters.
+        Always returns last_delta / total_move when a streak exists, plus ok/reason.
+        """
+        empty = {
+            "ok": False,
+            "streak": 0,
+            "last_delta": 0.0,
+            "total_move": 0.0,
+            "direction": None,
+            "reason": "no_history",
+        }
         if not history:
-            return None
+            return empty
         direction = history[-1].outcome
         if direction not in ("Up", "Down"):
-            return None
+            return {**empty, "reason": "unknown_outcome"}
 
         streak: list[WindowRecord] = []
         for rec in reversed(history):
@@ -346,18 +377,31 @@ class DualHedgeSimulator:
             streak.append(rec)
         streak.reverse()
         streak_len = len(streak)
-        if streak_len < self.min_streak or streak_len > self.max_streak:
-            return None
-
         last = streak[-1]
         first = streak[0]
         abs_delta = abs(last.final_price - last.price_to_beat)
         total_move = abs(last.final_price - first.price_to_beat)
+
+        result = {
+            "ok": False,
+            "streak": streak_len,
+            "last_delta": abs_delta,
+            "total_move": total_move,
+            "direction": direction,
+            "reason": "",
+        }
+        if streak_len < self.min_streak or streak_len > self.max_streak:
+            result["reason"] = f"streak={streak_len} not in [{self.min_streak},{self.max_streak}]"
+            return result
         if abs_delta > self.max_last_delta:
-            return None
-        if not (self.min_total_move <= total_move <= self.max_total_move):
-            return None
-        return streak_len, abs_delta, total_move, direction
+            result["reason"] = f"last>{self.max_last_delta}"
+            return result
+        if total_move < self.min_total_move or total_move > self.max_total_move:
+            result["reason"] = f"move not in [{self.min_total_move},{self.max_total_move}]"
+            return result
+        result["ok"] = True
+        result["reason"] = "pass"
+        return result
 
     def _infer_outcome_from_asks(
         self, up_ask: float, down_ask: float, threshold: float | None = None
@@ -411,7 +455,10 @@ class DualHedgeSimulator:
                 "notes": reason,
             }
         )
-        print(f"\n⏭  SIGNAL SKIPPED {slug} | {reason}")
+        self.status_line = f"no simulation last={abs_delta:.2f} move={total_move:.2f}"
+        self._print_event(
+            f"➖ no simulation last={abs_delta:.2f} move={total_move:.2f} | {reason} | {slug}"
+        )
 
     def _maybe_emit_setup(
         self,
@@ -437,14 +484,23 @@ class DualHedgeSimulator:
                 outcome=outcome,
             )
         )
-        metrics = self._streak_metrics(eval_history)
+        evaluation = self._evaluate_setup(eval_history)
         self._decided_windows.add(setup_window_start)
-        if metrics is None:
-            return None
 
-        streak_len, abs_delta, total_move, _direction = metrics
+        streak_len = int(evaluation["streak"])
+        abs_delta = float(evaluation["last_delta"])
+        total_move = float(evaluation["total_move"])
         target_window_start = setup_window_start + self.duration_seconds
         slug = self._target_slug(target_window_start)
+
+        if not evaluation["ok"]:
+            self.status_line = f"no simulation last={abs_delta:.2f} move={total_move:.2f}"
+            self._print_event(
+                f"➖ no simulation last={abs_delta:.2f} move={total_move:.2f} "
+                f"| streak={streak_len} {evaluation['direction'] or '?'} "
+                f"| {evaluation['reason']}"
+            )
+            return None
 
         free_before = self.capital.free_capital
         locked_before = self.capital.locked_capital
@@ -553,17 +609,19 @@ class DualHedgeSimulator:
             "mode": self.mode,
             "provisional": provisional,
         }
-        print(
-            f"\n📡 SIGNAL → next window {slug} | streak={streak_len} "
-            f"| Δ={abs_delta:.3f} | move={total_move:.3f} | limit={self.limit_cents}¢ "
-            f"| contracts={contracts} | invested=${required_cost:.2f} | mode={self.mode}"
+        self.status_line = (
+            f"Simulation started last={abs_delta:.2f} move={total_move:.2f}"
         )
-        print(
-            f"   capital free=${self.capital.free_capital:.2f} "
-            f"locked=${self.capital.locked_capital:.2f} equity=${self.capital.equity:.2f}"
+        self._print_event(
+            f"✅ Simulation started | streak={streak_len} {evaluation['direction']} "
+            f"| last={abs_delta:.2f} move={total_move:.2f} "
+            f"| → {slug} | {contracts}c @{self.limit_cents}¢ (${required_cost:.2f}) "
+            f"| free=${self.capital.free_capital:.2f} locked=${self.capital.locked_capital:.2f}"
         )
         if self.mode in ("paper", "live"):
-            print(f"⚠️  mode={self.mode}: order placement not implemented (simulation accounting only).")
+            self._print_event(
+                f"⚠️  mode={self.mode}: order placement not implemented (simulation accounting only)."
+            )
         return signal
 
     def _update_fills(self, window_start: int, lowest_up: float, lowest_down: float) -> None:
@@ -650,8 +708,9 @@ class DualHedgeSimulator:
             }
         )
 
-        print(
-            f"\n📒 TRADE SETTLED {trade.slug} | fill={fill_type} | outcome={outcome} "
+        self.status_line = f"settled pnl={pnl:+.2f} equity=${equity_after:.2f}"
+        self._print_event(
+            f"📒 TRADE SETTLED {trade.slug} | fill={fill_type} | outcome={outcome} "
             f"| pnl={pnl:+.4f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
         )
         del self.open_trades[window_start]

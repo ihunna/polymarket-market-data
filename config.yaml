@@ -13,7 +13,7 @@ position_sizing: fixed            # fixed (uses investable_per_trade)
 # ======================
 # Strategy
 # ======================
-limit_cents: 40                   # 40, 30, or 25
+limit_cents: 30                   # 40, 30, or 25
 min_streak: 3
 max_streak: 4
 max_last_delta: 0.15

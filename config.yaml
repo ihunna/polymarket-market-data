@@ -1,0 +1,21 @@
+# Market
+coin: solana
+duration_minutes: 15
+
+# Strategy filters
+min_streak: 3
+max_streak: 4
+max_last_delta: 0.15
+min_total_move: 0.20
+max_total_move: 0.80
+
+# Order / Simulation
+limit_cents: 40
+capital: 10.0
+mode: simulate                 # simulate | paper | live
+
+# Timing / Decision
+early_inference_threshold: 0.90   # side ≥ 90¢ → treat outcome as known
+decision_remaining_seconds: 120   # force decision when ≤ 2 minutes left
+early_decision_remaining: 180     # start watching for early inference at 3 min
+# Paths are derived as {coin}-{duration_minutes}-updown.csv / -trades.csv

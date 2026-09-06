@@ -9,14 +9,23 @@ import threading
 from datetime import datetime
 import zoneinfo
 import websocket
-from polymarket_poller import fetch_polymarket_data, fetch_polymarket_end_price, get_market_metadata_for_slug
+from polymarket_poller import (
+    fetch_polymarket_data,
+    fetch_polymarket_end_price,
+    fetch_polymarket_current_price,
+    get_market_metadata_for_slug,
+)
+from signal_engine import DualHedgeSimulator, load_config, data_file_paths
 
 COIN_NAME = "solana"
 SUPPORTED_DURATIONS = (5, 15, 60)
+CONFIG_PATH = "config.yaml"
 
-# Set in main() from CLI / env
+# Set in main() from config / CLI / env
 DURATION_MINUTES = 15
 WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
+APP_CONFIG = {}
+SIMULATOR = None
 
 # Global shared state for order book token asks only
 ws_state = {
@@ -63,6 +72,16 @@ def format_lowest_cents(lowest_seen):
         return f"{round(lowest_seen * 100)}¢"
     return "N/A"
 
+def infer_outcome_from_asks(up_ask, down_ask, threshold=None):
+    """Infer Up/Down from token asks. Uses config early threshold when provided."""
+    if threshold is None:
+        threshold = float(APP_CONFIG.get("early_inference_threshold", 0.90))
+    if up_ask >= threshold and up_ask >= down_ask:
+        return "Up"
+    if down_ask >= threshold and down_ask >= up_ask:
+        return "Down"
+    return None
+
 def update_window_progress(window_start, window_end, formatted_message):
     """Updates a single persistent line showing window progress and token ask data."""
     now = time.time()
@@ -85,7 +104,7 @@ def update_window_progress(window_start, window_end, formatted_message):
 
 def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, outcome):
     """Appends window results with formatted coin prices and lowest token ask extremes."""
-    filename = f"{COIN_NAME}-{DURATION_MINUTES}-updown.csv"
+    filename = APP_CONFIG.get("market_data_file") or f"{COIN_NAME}-{DURATION_MINUTES}-updown.csv"
     file_exists = os.path.isfile(filename)
     
     with open(filename, mode="a", newline="", encoding="utf-8") as f:
@@ -181,7 +200,7 @@ class PersistentPolymarketWS:
             if self.is_running:
                 time.sleep(2)
 
-def run_high_frequency_loop(ws_manager, price_to_beat):
+def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
     """Executes a window loop tracking token asks and syncing window boundary to ET/UTC epoch."""
     now_utc = calendar.timegm(time.gmtime())
     
@@ -216,11 +235,18 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
     initialized = False
+    current_price = 0.0
+    last_price_fetch_at = 0.0
+    early_decision_remaining = float(APP_CONFIG.get("early_decision_remaining", 180))
+    price_fetch_interval = 12.0
 
     print(f"📊 Price to Beat (Baseline): {format_dollar(price_to_beat)}")
 
     while True:
         current_time = time.time()
+        remaining = window_end - current_time
+        if remaining < 0:
+            remaining = 0
         
         if current_time >= window_end:
             print("\n⏳ Window ended. Fetching end price from Polymarket...")
@@ -243,6 +269,16 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
 
             log_to_csv(window_start, price_to_beat, final_price, l_up_fmt, l_down_fmt, outcome)
 
+            if simulator is not None:
+                simulator.on_window_close(
+                    window_start=window_start,
+                    price_to_beat=price_to_beat,
+                    final_price=final_price,
+                    outcome=outcome,
+                    lowest_up=lowest_up_seen,
+                    lowest_down=lowest_down_seen,
+                )
+
             print(
                 f"🏁 {DURATION_MINUTES}m window completed! Outcome: {outcome} | "
                 f"PTB: {format_dollar(price_to_beat)} | Final Price: {format_dollar(final_price)} | Logged"
@@ -264,6 +300,42 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
             if 0.0 < down_cost <= 1.0 and down_cost < lowest_down_seen:
                 lowest_down_seen = down_cost
 
+        # Refresh provisional TWAP only inside the decision watch window
+        if simulator is not None and remaining <= early_decision_remaining:
+            if current_time - last_price_fetch_at >= price_fetch_interval:
+                fetched = fetch_polymarket_current_price(
+                    window_start, duration_minutes=DURATION_MINUTES
+                )
+                last_price_fetch_at = current_time
+                if fetched > 0:
+                    current_price = fetched
+
+            inferred = infer_outcome_from_asks(up_cost, down_cost)
+            simulator.on_window_update(
+                window_start=window_start,
+                price_to_beat=price_to_beat,
+                current_price=current_price,
+                lowest_up=lowest_up_seen,
+                lowest_down=lowest_down_seen,
+                remaining_seconds=remaining,
+                up_ask=up_cost,
+                down_ask=down_cost,
+                inferred_outcome=inferred,
+            )
+        elif simulator is not None:
+            # Still track fills for an open position targeting this window
+            simulator.on_window_update(
+                window_start=window_start,
+                price_to_beat=price_to_beat,
+                current_price=current_price,
+                lowest_up=lowest_up_seen,
+                lowest_down=lowest_down_seen,
+                remaining_seconds=remaining,
+                up_ask=up_cost,
+                down_ask=down_cost,
+                inferred_outcome=None,
+            )
+
         up_cents = format_token_cents(up_cost)
         down_cents = format_token_cents(down_cost)
 
@@ -272,7 +344,7 @@ def run_high_frequency_loop(ws_manager, price_to_beat):
         
         time.sleep(0.5)
 
-def start_aligned_runner():
+def start_aligned_runner(simulator=None):
     """Initializes services and prompts for initial manual PTB."""
     print(f"🔌 Initializing services... (window={DURATION_MINUTES}m)")
     global_ws_manager = PersistentPolymarketWS()
@@ -287,7 +359,11 @@ def start_aligned_runner():
 
     while True:
         try:
-            current_ptb = run_high_frequency_loop(global_ws_manager, price_to_beat=current_ptb)
+            current_ptb = run_high_frequency_loop(
+                global_ws_manager,
+                price_to_beat=current_ptb,
+                simulator=simulator,
+            )
         except Exception as e:
             print(f"\nError in loop execution: {e}. Restarting cycle...")
             time.sleep(2)
@@ -299,11 +375,17 @@ def parse_args():
         type=int,
         choices=SUPPORTED_DURATIONS,
         default=None,
-        help="Window duration in minutes (5, 15, or 60). Default: 15.",
+        help="Window duration in minutes (5, 15, or 60). Default: from config.yaml / 15.",
+    )
+    parser.add_argument(
+        "-c", "--config",
+        type=str,
+        default=CONFIG_PATH,
+        help="Path to config.yaml (default: config.yaml).",
     )
     return parser.parse_args()
 
-def resolve_duration(cli_duration):
+def resolve_duration(cli_duration, config_duration):
     if cli_duration is not None:
         return cli_duration
     env_val = os.environ.get("WINDOW_DURATION_MINUTES", "").strip()
@@ -315,10 +397,32 @@ def resolve_duration(cli_duration):
         if minutes not in SUPPORTED_DURATIONS:
             raise SystemExit(f"Unsupported WINDOW_DURATION_MINUTES={minutes}; choose from {SUPPORTED_DURATIONS}.")
         return minutes
+    if config_duration is not None:
+        minutes = int(config_duration)
+        if minutes not in SUPPORTED_DURATIONS:
+            raise SystemExit(f"Unsupported duration_minutes={minutes} in config; choose from {SUPPORTED_DURATIONS}.")
+        return minutes
     return 15
 
 if __name__ == "__main__":
     args = parse_args()
-    DURATION_MINUTES = resolve_duration(args.duration)
+    APP_CONFIG = load_config(args.config)
+    COIN_NAME = str(APP_CONFIG.get("coin", COIN_NAME))
+    DURATION_MINUTES = resolve_duration(args.duration, APP_CONFIG.get("duration_minutes"))
     WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
-    start_aligned_runner()
+    # Keep simulator duration + file paths aligned with effective runtime duration
+    APP_CONFIG = dict(APP_CONFIG)
+    APP_CONFIG["duration_minutes"] = DURATION_MINUTES
+    market_file, trades_file = data_file_paths(COIN_NAME, DURATION_MINUTES)
+    APP_CONFIG["market_data_file"] = market_file
+    APP_CONFIG["trades_log_file"] = trades_file
+
+    SIMULATOR = DualHedgeSimulator(APP_CONFIG)
+    print(
+        f"⚙️  Config loaded | mode={APP_CONFIG['mode']} | limit={APP_CONFIG['limit_cents']}¢ | "
+        f"capital={APP_CONFIG['capital']} | history={len(SIMULATOR.history)} windows"
+    )
+    print(
+        f"📁 market={APP_CONFIG['market_data_file']} | trades={APP_CONFIG['trades_log_file']}"
+    )
+    start_aligned_runner(simulator=SIMULATOR)

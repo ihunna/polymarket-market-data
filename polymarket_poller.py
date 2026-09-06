@@ -49,6 +49,20 @@ def _fetch_price_history(window_start_epoch: int, window_end_epoch: int, duratio
     except Exception:
         return None
 
+def fetch_polymarket_current_price(window_start_epoch: int, duration_minutes: int = 15) -> float:
+    """Fetches the latest available TWAP point for an in-progress window (no end wait)."""
+    window_duration_seconds = duration_minutes * 60
+    window_end_epoch = window_start_epoch + window_duration_seconds
+    points = _fetch_price_history(window_start_epoch, window_end_epoch, duration_minutes)
+    if not points:
+        return 0.0
+    try:
+        latest_value = float(points[-1].get("value", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return latest_value if latest_value > 0 else 0.0
+
+
 def fetch_polymarket_end_price(window_start_epoch: int, duration_minutes: int = 15) -> float:
     """Fetches the TWAP end price for a completed window of the given duration."""
     window_duration_seconds = duration_minutes * 60

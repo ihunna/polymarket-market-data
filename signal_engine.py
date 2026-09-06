@@ -349,8 +349,14 @@ class DualHedgeSimulator:
 
     def _evaluate_setup(self, history: list[WindowRecord]) -> dict[str, Any]:
         """
-        Evaluate trailing streak filters.
-        Always returns last_delta / total_move when a streak exists, plus ok/reason.
+        Evaluate trailing streak filters with reset-after-max_streak counting.
+
+        A raw run of the same outcome is mapped onto a cycling counter:
+        1..max_streak, then resets to 1. Example with max_streak=4:
+        raw 1,2,3,4,5,6,7 → counted 1,2,3,4,1,2,3
+
+        last_delta uses the latest candle; total_move uses only the current
+        cycle segment (last `counted` candles), not the full raw run.
         """
         empty = {
             "ok": False,
@@ -372,22 +378,28 @@ class DualHedgeSimulator:
                 break
             streak.append(rec)
         streak.reverse()
-        streak_len = len(streak)
-        last = streak[-1]
-        first = streak[0]
+        raw_len = len(streak)
+        # Reset counter after max_streak (e.g. 4 → next candle counts as 1)
+        counted = ((raw_len - 1) % self.max_streak) + 1
+        segment = streak[-counted:]
+        last = segment[-1]
+        first = segment[0]
         abs_delta = abs(last.final_price - last.price_to_beat)
         total_move = abs(last.final_price - first.price_to_beat)
 
         result = {
             "ok": False,
-            "streak": streak_len,
+            "streak": counted,
             "last_delta": abs_delta,
             "total_move": total_move,
             "direction": direction,
             "reason": "",
         }
-        if streak_len < self.min_streak or streak_len > self.max_streak:
-            result["reason"] = f"streak={streak_len} not in [{self.min_streak},{self.max_streak}]"
+        if counted < self.min_streak or counted > self.max_streak:
+            raw_note = f" raw={raw_len}" if raw_len != counted else ""
+            result["reason"] = (
+                f"streak={counted}{raw_note} not in [{self.min_streak},{self.max_streak}]"
+            )
             return result
         if abs_delta > self.max_last_delta:
             result["reason"] = f"last>{self.max_last_delta}"
@@ -398,7 +410,7 @@ class DualHedgeSimulator:
             result["reason"] = f"move not in [{self.min_total_move},{self.max_total_move}]"
             return result
         result["ok"] = True
-        result["reason"] = "pass"
+        result["reason"] = "pass" if raw_len == counted else f"pass raw={raw_len}"
         return result
 
     def _log_skip(

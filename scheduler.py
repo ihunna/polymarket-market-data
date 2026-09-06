@@ -12,7 +12,6 @@ import websocket
 from polymarket_poller import (
     fetch_polymarket_data,
     fetch_polymarket_end_price,
-    fetch_polymarket_current_price,
     get_market_metadata_for_slug,
 )
 from signal_engine import DualHedgeSimulator, load_config, data_file_paths
@@ -71,16 +70,6 @@ def format_lowest_cents(lowest_seen):
     if lowest_seen != float('inf') and lowest_seen > 0:
         return f"{round(lowest_seen * 100)}¢"
     return "N/A"
-
-def infer_outcome_from_asks(up_ask, down_ask, threshold=None):
-    """Infer Up/Down from token asks. Uses config early threshold when provided."""
-    if threshold is None:
-        threshold = float(APP_CONFIG.get("early_inference_threshold", 0.90))
-    if up_ask >= threshold and up_ask >= down_ask:
-        return "Up"
-    if down_ask >= threshold and down_ask >= up_ask:
-        return "Down"
-    return None
 
 def update_window_progress(window_start, window_end, formatted_message):
     """Updates a single persistent line showing window progress and token ask data."""
@@ -237,10 +226,6 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
     initialized = False
-    current_price = 0.0
-    last_price_fetch_at = 0.0
-    early_decision_remaining = float(APP_CONFIG.get("early_decision_remaining", 180))
-    price_fetch_interval = 12.0
 
     print(f"📊 Price to Beat (Baseline): {format_dollar(price_to_beat)}")
 
@@ -302,34 +287,12 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
             if 0.0 < down_cost <= 1.0 and down_cost < lowest_down_seen:
                 lowest_down_seen = down_cost
 
-        # Refresh provisional TWAP only inside the decision watch window
-        if simulator is not None and remaining <= early_decision_remaining:
-            if current_time - last_price_fetch_at >= price_fetch_interval:
-                fetched = fetch_polymarket_current_price(
-                    window_start, duration_minutes=DURATION_MINUTES
-                )
-                last_price_fetch_at = current_time
-                if fetched > 0:
-                    current_price = fetched
-
-            inferred = infer_outcome_from_asks(up_cost, down_cost)
+        if simulator is not None:
+            # Fills only during the window; setup evaluation is close-only
             simulator.on_window_update(
                 window_start=window_start,
                 price_to_beat=price_to_beat,
-                current_price=current_price,
-                lowest_up=lowest_up_seen,
-                lowest_down=lowest_down_seen,
-                remaining_seconds=remaining,
-                up_ask=up_cost,
-                down_ask=down_cost,
-                inferred_outcome=inferred,
-            )
-        elif simulator is not None:
-            # Still track fills for an open position targeting this window
-            simulator.on_window_update(
-                window_start=window_start,
-                price_to_beat=price_to_beat,
-                current_price=current_price,
+                current_price=0.0,
                 lowest_up=lowest_up_seen,
                 lowest_down=lowest_down_seen,
                 remaining_seconds=remaining,

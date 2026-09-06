@@ -24,10 +24,5 @@ max_total_move: 0.80
 # Order / Simulation
 mode: simulate                    # simulate | paper | live
 
-# ======================
-# Timing
-# ======================
-early_inference_threshold: 0.90
-decision_remaining_seconds: 120
-early_decision_remaining: 180     # start watching for early inference at 3 min
+# Setup evaluation is close-only (final TWAP + outcome).
 # Paths are derived as {coin}-{duration_minutes}-updown.csv / -trades.csv

@@ -71,9 +71,6 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
         "max_total_move",
         "limit_cents",
         "mode",
-        "early_inference_threshold",
-        "decision_remaining_seconds",
-        "early_decision_remaining",
     ]
     missing = [k for k in required if k not in data]
     if missing:
@@ -226,9 +223,6 @@ class DualHedgeSimulator:
         self.limit_cents = int(config["limit_cents"])
         self.limit_price = self.limit_cents / 100.0
         self.mode = str(config["mode"])
-        self.early_inference_threshold = float(config["early_inference_threshold"])
-        self.decision_remaining_seconds = float(config["decision_remaining_seconds"])
-        self.early_decision_remaining = float(config["early_decision_remaining"])
         self.market_data_file = str(config["market_data_file"])
         self.trades_log_file = str(config["trades_log_file"])
         self.position_sizing = str(config["position_sizing"])
@@ -407,16 +401,6 @@ class DualHedgeSimulator:
         result["reason"] = "pass"
         return result
 
-    def _infer_outcome_from_asks(
-        self, up_ask: float, down_ask: float, threshold: float | None = None
-    ) -> str | None:
-        thr = self.early_inference_threshold if threshold is None else threshold
-        if up_ask >= thr and up_ask >= down_ask:
-            return "Up"
-        if down_ask >= thr and down_ask >= up_ask:
-            return "Down"
-        return None
-
     def _log_skip(
         self,
         setup_window_start: int,
@@ -470,8 +454,8 @@ class DualHedgeSimulator:
         price_to_beat: float,
         final_price: float,
         outcome: str,
-        provisional: bool,
     ) -> dict[str, Any] | None:
+        """Evaluate setup once at window close using final TWAP + outcome."""
         if setup_window_start in self._decided_windows:
             return None
         if final_price <= 0 or outcome not in ("Up", "Down"):
@@ -546,10 +530,8 @@ class DualHedgeSimulator:
 
         signal_ts = int(time.time())
         note = "pending"
-        if provisional:
-            note = "pending;early_inference"
         if reason == "unlocked":
-            note = f"{note};capital_unlocked"
+            note = "pending;capital_unlocked"
 
         trade = OpenTrade(
             signal_timestamp=signal_ts,
@@ -611,7 +593,6 @@ class DualHedgeSimulator:
             "contracts": trade.contracts,
             "invested_amount": trade.invested_amount,
             "mode": self.mode,
-            "provisional": provisional,
         }
         self.status_line = (
             f"Simulation started last={abs_delta:.2f} move={total_move:.2f}"
@@ -731,57 +712,11 @@ class DualHedgeSimulator:
         down_ask: float,
         inferred_outcome: str | None,
     ) -> dict[str, Any] | None:
-        """
-        Called frequently from the main loop.
-        Returns signal dict or None.
-        """
+        """Track simulated fills only. Setup decisions happen at close."""
         if self._active_window_start != window_start:
             self._active_window_start = window_start
-
         self._update_fills(window_start, lowest_up, lowest_down)
-
-        if window_start in self._decided_windows:
-            return None
-
-        if current_price is None or current_price <= 0:
-            return None
-
-        signal = None
-
-        # 1) Early inference
-        if remaining_seconds <= self.early_decision_remaining:
-            early_outcome = inferred_outcome or self._infer_outcome_from_asks(up_ask, down_ask)
-            if early_outcome and (
-                max(up_ask, down_ask) >= self.early_inference_threshold
-            ):
-                signal = self._maybe_emit_setup(
-                    setup_window_start=window_start,
-                    price_to_beat=price_to_beat,
-                    final_price=current_price,
-                    outcome=early_outcome,
-                    provisional=True,
-                )
-                return signal
-
-        # 2) Hard deadline
-        if remaining_seconds <= self.decision_remaining_seconds:
-            forced = inferred_outcome or self._infer_outcome_from_asks(
-                up_ask, down_ask, threshold=0.5
-            )
-            if forced is None and up_ask > 0 and down_ask > 0:
-                if up_ask > down_ask and up_ask > 0.5:
-                    forced = "Up"
-                elif down_ask > up_ask and down_ask > 0.5:
-                    forced = "Down"
-            if forced:
-                signal = self._maybe_emit_setup(
-                    setup_window_start=window_start,
-                    price_to_beat=price_to_beat,
-                    final_price=current_price,
-                    outcome=forced,
-                    provisional=True,
-                )
-        return signal
+        return None
 
     def on_window_close(
         self,
@@ -792,7 +727,7 @@ class DualHedgeSimulator:
         lowest_up: float,
         lowest_down: float,
     ) -> dict[str, Any] | None:
-        """Final accounting for the just-closed window. Returns signal if emitted at close."""
+        """Settle open trades, then evaluate setup with final TWAP + outcome."""
         self._update_fills(window_start, lowest_up, lowest_down)
         self._settle_open_trade(window_start, outcome)
 
@@ -803,7 +738,6 @@ class DualHedgeSimulator:
                 price_to_beat=price_to_beat,
                 final_price=final_price,
                 outcome=outcome,
-                provisional=False,
             )
         else:
             self._decided_windows.add(window_start)

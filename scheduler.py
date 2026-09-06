@@ -420,7 +420,8 @@ if __name__ == "__main__":
     SIMULATOR = DualHedgeSimulator(APP_CONFIG)
     print(
         f"⚙️  Config loaded | mode={APP_CONFIG['mode']} | limit={APP_CONFIG['limit_cents']}¢ | "
-        f"capital={APP_CONFIG['capital']} | history={len(SIMULATOR.history)} windows"
+        f"total=${APP_CONFIG['total_capital']} | per_trade=${APP_CONFIG['investable_per_trade']} | "
+        f"capital_mode={APP_CONFIG['capital_mode']} | history={len(SIMULATOR.history)} windows"
     )
     print(
         f"📁 market={APP_CONFIG['market_data_file']} | trades={APP_CONFIG['trades_log_file']}"

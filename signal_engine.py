@@ -20,6 +20,9 @@ TRADES_HEADER = [
     "setup_total_move",
     "limit_cents",
     "capital_before",
+    "free_capital_before",
+    "locked_capital_before",
+    "invested_amount",
     "contracts",
     "up_filled",
     "down_filled",
@@ -30,6 +33,7 @@ TRADES_HEADER = [
     "exit_down",
     "pnl",
     "capital_after",
+    "free_capital_after",
     "mode",
     "notes",
 ]
@@ -54,13 +58,16 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     required = [
         "coin",
         "duration_minutes",
+        "total_capital",
+        "investable_per_trade",
+        "capital_mode",
+        "position_sizing",
         "min_streak",
         "max_streak",
         "max_last_delta",
         "min_total_move",
         "max_total_move",
         "limit_cents",
-        "capital",
         "mode",
         "early_inference_threshold",
         "decision_remaining_seconds",
@@ -69,6 +76,10 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     missing = [k for k in required if k not in data]
     if missing:
         raise ValueError(f"Config missing keys: {missing}")
+    if data["capital_mode"] not in ("locked", "unlocked"):
+        raise ValueError("capital_mode must be 'locked' or 'unlocked'")
+    if data["position_sizing"] not in ("fixed",):
+        raise ValueError("position_sizing must be 'fixed'")
     market_file, trades_file = data_file_paths(data["coin"], data["duration_minutes"])
     data["market_data_file"] = market_file
     data["trades_log_file"] = trades_file
@@ -95,6 +106,79 @@ def _coin_slug_prefix(coin: str) -> str:
     return coin
 
 
+class CapitalManager:
+    """Tracks free vs locked capital and per-window position locks."""
+
+    def __init__(self, total_capital: float, investable_per_trade: float, capital_mode: str):
+        self.total_capital = float(total_capital)
+        self.investable_per_trade = float(investable_per_trade)
+        self.capital_mode = capital_mode
+        self.free_capital = float(total_capital)
+        self.locked_capital = 0.0
+        self.open_positions: dict[int, float] = {}  # window_start → locked_amount
+
+    @property
+    def equity(self) -> float:
+        return self.free_capital + self.locked_capital
+
+    def calculate_contracts(self, limit_cents: int) -> int:
+        cost_per_dual = (limit_cents / 100.0) * 2.0
+        if cost_per_dual <= 0:
+            return 0
+        if self.capital_mode == "unlocked":
+            max_investment = self.investable_per_trade
+        else:
+            max_investment = min(self.investable_per_trade, self.free_capital)
+        contracts = int(max_investment // cost_per_dual)
+        return max(contracts, 0)
+
+    def required_cost(self, contracts: int, limit_cents: int) -> float:
+        return contracts * (limit_cents / 100.0) * 2.0
+
+    def try_lock(self, window_start: int, amount: float) -> tuple[bool, str]:
+        """
+        Attempt to allocate capital for a trade targeting window_start.
+        Returns (ok, reason).
+        """
+        if amount <= 0:
+            return False, "Insufficient free capital"
+        if window_start in self.open_positions:
+            return False, "Position already open for window"
+
+        if self.capital_mode == "unlocked":
+            # Theoretical mode: always take, no lock against free capital
+            self.open_positions[window_start] = amount
+            return True, "unlocked"
+
+        max_we_can_use = min(self.investable_per_trade, self.free_capital)
+        if amount > max_we_can_use + 1e-9:
+            return False, "Insufficient free capital"
+
+        self.free_capital -= amount
+        self.locked_capital += amount
+        self.open_positions[window_start] = amount
+        return True, "locked"
+
+    def release(self, window_start: int, pnl: float) -> tuple[float, float, float]:
+        """
+        Unlock funds for a resolved window and apply PnL.
+        Returns (locked_amount, free_after, equity_after).
+        """
+        locked_amount = self.open_positions.pop(window_start, 0.0)
+
+        if self.capital_mode == "locked" and locked_amount > 0:
+            self.locked_capital -= locked_amount
+            self.free_capital += locked_amount + pnl
+        else:
+            # Unlocked: equity tracked via free_capital only
+            self.free_capital += pnl
+            self.total_capital = self.equity
+
+        # Keep total_capital as running equity for audit
+        self.total_capital = self.equity
+        return locked_amount, self.free_capital, self.equity
+
+
 @dataclass
 class WindowRecord:
     window_start: int
@@ -114,7 +198,10 @@ class OpenTrade:
     setup_total_move: float
     limit_cents: int
     capital_before: float
-    contracts: float
+    free_capital_before: float
+    locked_capital_before: float
+    invested_amount: float
+    contracts: int
     up_filled: bool = False
     down_filled: bool = False
     entry_up: float | None = None
@@ -135,16 +222,22 @@ class DualHedgeSimulator:
         self.max_total_move = float(config["max_total_move"])
         self.limit_cents = int(config["limit_cents"])
         self.limit_price = self.limit_cents / 100.0
-        self.capital = float(config["capital"])
         self.mode = str(config["mode"])
         self.early_inference_threshold = float(config["early_inference_threshold"])
         self.decision_remaining_seconds = float(config["decision_remaining_seconds"])
         self.early_decision_remaining = float(config["early_decision_remaining"])
         self.market_data_file = str(config["market_data_file"])
         self.trades_log_file = str(config["trades_log_file"])
+        self.position_sizing = str(config["position_sizing"])
+
+        self.capital = CapitalManager(
+            total_capital=float(config["total_capital"]),
+            investable_per_trade=float(config["investable_per_trade"]),
+            capital_mode=str(config["capital_mode"]),
+        )
 
         self.history: list[WindowRecord] = []
-        self.open_trade: OpenTrade | None = None
+        self.open_trades: dict[int, OpenTrade] = {}  # target_window_start → trade
         self._decided_windows: set[int] = set()
         self._active_window_start: int | None = None
 
@@ -161,7 +254,6 @@ class DualHedgeSimulator:
                 reader = csv.DictReader(f)
                 if not reader.fieldnames:
                     return
-                # Normalize header keys (legacy: "Price to beat", " Last price", etc.)
                 field_map = {name.strip().lower(): name for name in reader.fieldnames if name}
 
                 def col(*candidates: str) -> str | None:
@@ -207,7 +299,14 @@ class DualHedgeSimulator:
     def _ensure_trades_header(self) -> None:
         path = self.trades_log_file
         if os.path.isfile(path) and os.path.getsize(path) > 0:
-            return
+            with open(path, newline="", encoding="utf-8") as f:
+                existing = next(csv.reader(f), None)
+            if existing == TRADES_HEADER:
+                return
+            # Schema changed — archive old file and start fresh header
+            archived = f"{path}.bak"
+            os.replace(path, archived)
+            print(f"⚠️  Trades log schema updated; old file moved to {archived}")
         with open(path, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(TRADES_HEADER)
@@ -270,6 +369,50 @@ class DualHedgeSimulator:
             return "Down"
         return None
 
+    def _log_skip(
+        self,
+        setup_window_start: int,
+        target_window_start: int,
+        slug: str,
+        streak_len: int,
+        abs_delta: float,
+        total_move: float,
+        reason: str,
+        free_before: float,
+        locked_before: float,
+        equity_before: float,
+    ) -> None:
+        self._append_trades_row(
+            {
+                "signal_timestamp": int(time.time()),
+                "target_window_start": target_window_start,
+                "slug": slug,
+                "setup_window_start": setup_window_start,
+                "setup_streak": streak_len,
+                "setup_abs_delta": round(abs_delta, 6),
+                "setup_total_move": round(total_move, 6),
+                "limit_cents": self.limit_cents,
+                "capital_before": round(equity_before, 6),
+                "free_capital_before": round(free_before, 6),
+                "locked_capital_before": round(locked_before, 6),
+                "invested_amount": 0,
+                "contracts": 0,
+                "up_filled": "",
+                "down_filled": "",
+                "fill_type": "skipped",
+                "entry_up": "",
+                "entry_down": "",
+                "exit_up": "",
+                "exit_down": "",
+                "pnl": "",
+                "capital_after": round(equity_before, 6),
+                "free_capital_after": round(free_before, 6),
+                "mode": self.mode,
+                "notes": reason,
+            }
+        )
+        print(f"\n⏭  SIGNAL SKIPPED {slug} | {reason}")
+
     def _maybe_emit_setup(
         self,
         setup_window_start: int,
@@ -283,7 +426,6 @@ class DualHedgeSimulator:
         if final_price <= 0 or outcome not in ("Up", "Down"):
             return None
 
-        # Build evaluation history: prior completed + this setup candle
         eval_history = [
             r for r in self.history if r.window_start < setup_window_start
         ]
@@ -303,11 +445,51 @@ class DualHedgeSimulator:
         streak_len, abs_delta, total_move, _direction = metrics
         target_window_start = setup_window_start + self.duration_seconds
         slug = self._target_slug(target_window_start)
-        contracts = self.capital / (2.0 * self.limit_price) if self.limit_price > 0 else 0.0
+
+        free_before = self.capital.free_capital
+        locked_before = self.capital.locked_capital
+        equity_before = self.capital.equity
+
+        contracts = self.capital.calculate_contracts(self.limit_cents)
+        required_cost = self.capital.required_cost(contracts, self.limit_cents)
+
+        if contracts <= 0 or required_cost <= 0:
+            self._log_skip(
+                setup_window_start,
+                target_window_start,
+                slug,
+                streak_len,
+                abs_delta,
+                total_move,
+                "Insufficient free capital",
+                free_before,
+                locked_before,
+                equity_before,
+            )
+            return None
+
+        ok, reason = self.capital.try_lock(target_window_start, required_cost)
+        if not ok:
+            self._log_skip(
+                setup_window_start,
+                target_window_start,
+                slug,
+                streak_len,
+                abs_delta,
+                total_move,
+                reason,
+                free_before,
+                locked_before,
+                equity_before,
+            )
+            return None
+
         signal_ts = int(time.time())
         note = "pending"
         if provisional:
             note = "pending;early_inference"
+        if reason == "unlocked":
+            note = f"{note};capital_unlocked"
 
         trade = OpenTrade(
             signal_timestamp=signal_ts,
@@ -318,11 +500,14 @@ class DualHedgeSimulator:
             setup_abs_delta=round(abs_delta, 6),
             setup_total_move=round(total_move, 6),
             limit_cents=self.limit_cents,
-            capital_before=self.capital,
-            contracts=round(contracts, 6),
+            capital_before=round(equity_before, 6),
+            free_capital_before=round(free_before, 6),
+            locked_capital_before=round(locked_before, 6),
+            invested_amount=round(required_cost, 6),
+            contracts=contracts,
             notes=note,
         )
-        self.open_trade = trade
+        self.open_trades[target_window_start] = trade
 
         self._append_trades_row(
             {
@@ -335,6 +520,9 @@ class DualHedgeSimulator:
                 "setup_total_move": trade.setup_total_move,
                 "limit_cents": trade.limit_cents,
                 "capital_before": trade.capital_before,
+                "free_capital_before": trade.free_capital_before,
+                "locked_capital_before": trade.locked_capital_before,
+                "invested_amount": trade.invested_amount,
                 "contracts": trade.contracts,
                 "up_filled": "",
                 "down_filled": "",
@@ -345,6 +533,7 @@ class DualHedgeSimulator:
                 "exit_down": "",
                 "pnl": "",
                 "capital_after": "",
+                "free_capital_after": "",
                 "mode": self.mode,
                 "notes": trade.notes,
             }
@@ -360,20 +549,26 @@ class DualHedgeSimulator:
             "setup_total_move": trade.setup_total_move,
             "limit_cents": trade.limit_cents,
             "contracts": trade.contracts,
+            "invested_amount": trade.invested_amount,
             "mode": self.mode,
             "provisional": provisional,
         }
         print(
             f"\n📡 SIGNAL → next window {slug} | streak={streak_len} "
-            f"| Δ={abs_delta:.3f} | move={total_move:.3f} | limit={self.limit_cents}¢ | mode={self.mode}"
+            f"| Δ={abs_delta:.3f} | move={total_move:.3f} | limit={self.limit_cents}¢ "
+            f"| contracts={contracts} | invested=${required_cost:.2f} | mode={self.mode}"
+        )
+        print(
+            f"   capital free=${self.capital.free_capital:.2f} "
+            f"locked=${self.capital.locked_capital:.2f} equity=${self.capital.equity:.2f}"
         )
         if self.mode in ("paper", "live"):
             print(f"⚠️  mode={self.mode}: order placement not implemented (simulation accounting only).")
         return signal
 
     def _update_fills(self, window_start: int, lowest_up: float, lowest_down: float) -> None:
-        trade = self.open_trade
-        if trade is None or trade.target_window_start != window_start:
+        trade = self.open_trades.get(window_start)
+        if trade is None:
             return
         if lowest_up != float("inf") and 0.0 < lowest_up <= self.limit_price:
             trade.up_filled = True
@@ -383,8 +578,8 @@ class DualHedgeSimulator:
             trade.entry_down = self.limit_price
 
     def _settle_open_trade(self, window_start: int, outcome: str) -> None:
-        trade = self.open_trade
-        if trade is None or trade.target_window_start != window_start:
+        trade = self.open_trades.get(window_start)
+        if trade is None:
             return
 
         up_filled = trade.up_filled
@@ -411,14 +606,14 @@ class DualHedgeSimulator:
                 exit_down = 1.0 if outcome == "Down" else 0.0
                 pnl += contracts * (exit_down - (trade.entry_down or self.limit_price))
         else:
-            # Unknown outcome: mark unsettled economics as zero, note it
             if up_filled:
                 exit_up = ""
             if down_filled:
                 exit_down = ""
             pnl = 0.0
 
-        capital_after = self.capital + pnl
+        _locked_amount, free_after, equity_after = self.capital.release(window_start, pnl)
+
         note = "settled"
         if outcome not in ("Up", "Down"):
             note = "settled;outcome_unknown"
@@ -436,6 +631,9 @@ class DualHedgeSimulator:
                 "setup_total_move": trade.setup_total_move,
                 "limit_cents": trade.limit_cents,
                 "capital_before": trade.capital_before,
+                "free_capital_before": trade.free_capital_before,
+                "locked_capital_before": trade.locked_capital_before,
+                "invested_amount": trade.invested_amount,
                 "contracts": trade.contracts,
                 "up_filled": up_filled,
                 "down_filled": down_filled,
@@ -445,18 +643,18 @@ class DualHedgeSimulator:
                 "exit_up": exit_up if exit_up is not None else "",
                 "exit_down": exit_down if exit_down is not None else "",
                 "pnl": round(pnl, 6),
-                "capital_after": round(capital_after, 6),
+                "capital_after": round(equity_after, 6),
+                "free_capital_after": round(free_after, 6),
                 "mode": self.mode,
                 "notes": note,
             }
         )
 
-        self.capital = capital_after
         print(
             f"\n📒 TRADE SETTLED {trade.slug} | fill={fill_type} | outcome={outcome} "
-            f"| pnl={pnl:+.4f} | capital={capital_after:.4f}"
+            f"| pnl={pnl:+.4f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
         )
-        self.open_trade = None
+        del self.open_trades[window_start]
 
     def on_window_update(
         self,
@@ -477,13 +675,11 @@ class DualHedgeSimulator:
         if self._active_window_start != window_start:
             self._active_window_start = window_start
 
-        # Track simulated fills while we are inside the target window
         self._update_fills(window_start, lowest_up, lowest_down)
 
         if window_start in self._decided_windows:
             return None
 
-        # Need a usable provisional final price for streak math
         if current_price is None or current_price <= 0:
             return None
 
@@ -509,7 +705,6 @@ class DualHedgeSimulator:
             forced = inferred_outcome or self._infer_outcome_from_asks(
                 up_ask, down_ask, threshold=0.5
             )
-            # Prefer dominant side when forcing near deadline
             if forced is None and up_ask > 0 and down_ask > 0:
                 if up_ask > down_ask and up_ask > 0.5:
                     forced = "Up"
@@ -535,14 +730,10 @@ class DualHedgeSimulator:
         lowest_down: float,
     ) -> dict[str, Any] | None:
         """Final accounting for the just-closed window. Returns signal if emitted at close."""
-        # Update fills one last time for positions targeting this window
         self._update_fills(window_start, lowest_up, lowest_down)
-
-        # Settle any open trade that targeted this window
         self._settle_open_trade(window_start, outcome)
 
         signal = None
-        # Fallback: decide setup at close if not already decided
         if window_start not in self._decided_windows and outcome in ("Up", "Down"):
             signal = self._maybe_emit_setup(
                 setup_window_start=window_start,
@@ -554,7 +745,6 @@ class DualHedgeSimulator:
         else:
             self._decided_windows.add(window_start)
 
-        # Persist completed window into rolling history
         if outcome in ("Up", "Down") and final_price > 0 and price_to_beat > 0:
             self._append_history(
                 WindowRecord(
@@ -565,7 +755,6 @@ class DualHedgeSimulator:
                 )
             )
 
-        # Bound decided-window set
         if len(self._decided_windows) > HISTORY_LIMIT * 2:
             cutoff = window_start - self.duration_seconds * HISTORY_LIMIT
             self._decided_windows = {w for w in self._decided_windows if w >= cutoff}

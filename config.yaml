@@ -2,27 +2,36 @@
 coin: solana
 duration_minutes: 15
 
-# ======================
-# Capital & Risk
-# ======================
-total_capital: 100.0              # Overall account size
-investable_per_trade: 10.0        # Maximum $ allocated to any single setup
-capital_mode: locked              # locked | unlocked
-position_sizing: fixed            # fixed (uses investable_per_trade)
-
-# ======================
-# Strategy
-# ======================
-limit_cents: 30                   # 40, 30, or 25
-min_streak: 3
-max_streak: 4
-max_last_delta: 0.15
-use_total_move: true              # false = ignore min/max_total_move filter
-min_total_move: 0.20
-max_total_move: 0.80
-
-# Order / Simulation
+# Global
 mode: simulate                    # simulate | paper | live
 
-# Setup evaluation is close-only (final TWAP + outcome).
-# Paths are derived as {coin}-{duration_minutes}-updown.csv / -trades.csv
+# Strategies
+strategies:
+  dual_hedge:
+    enabled: true
+    capital: 100.0
+    investable_per_trade: 10.0
+    capital_mode: locked
+    limit_cents: 30
+    min_streak: 3
+    max_streak: 4
+    max_last_delta: 0.15
+    use_total_move: true
+    min_total_move: 0.20
+    max_total_move: 0.80
+    use_reset_streak: true
+    early_inference_threshold: 0.90
+    decision_remaining_seconds: 120
+    # trades file defaults to {coin}-{duration_minutes}-trades.csv
+
+  late_80:
+    enabled: true
+    capital: 100.0
+    investable_per_trade: 10.0
+    capital_mode: locked
+    threshold_min_cents: 80
+    threshold_max_cents: 90
+    decision_remaining_seconds: 240
+    use_delta_filter: true
+    min_abs_delta: 0.15
+    trades_file: "solana-15-trades-late_80.csv"

@@ -309,11 +309,51 @@ class DualHedgeSimulator:
             writer = csv.writer(f)
             writer.writerow(TRADES_HEADER)
 
+    def _read_trades_rows(self) -> list[dict[str, str]]:
+        path = self.trades_log_file
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return []
+            return [dict(row) for row in reader]
+
+    def _write_trades_rows(self, rows: list[dict[str, Any]]) -> None:
+        path = self.trades_log_file
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=TRADES_HEADER, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in TRADES_HEADER})
+        os.replace(tmp_path, path)
+
     def _append_trades_row(self, row: dict[str, Any]) -> None:
+        """Append a new trade row (signal open or capital skip)."""
         self._ensure_trades_header()
         with open(self.trades_log_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=TRADES_HEADER, extrasaction="ignore")
             writer.writerow({k: row.get(k, "") for k in TRADES_HEADER})
+
+    def _update_pending_trade_row(self, target_window_start: int, row: dict[str, Any]) -> None:
+        """Replace the pending row for target_window_start in place; append if missing."""
+        self._ensure_trades_header()
+        rows = self._read_trades_rows()
+        target_key = str(target_window_start)
+        updated = False
+        for i in range(len(rows) - 1, -1, -1):
+            existing = rows[i]
+            if str(existing.get("target_window_start", "")) != target_key:
+                continue
+            fill = str(existing.get("fill_type", "")).strip().lower()
+            if fill in ("pending", ""):
+                rows[i] = {k: row.get(k, "") for k in TRADES_HEADER}
+                updated = True
+                break
+        if not updated:
+            rows.append({k: row.get(k, "") for k in TRADES_HEADER})
+        self._write_trades_rows(rows)
 
     def _target_slug(self, target_window_start: int) -> str:
         prefix = _coin_slug_prefix(self.coin)
@@ -675,7 +715,8 @@ class DualHedgeSimulator:
         if self.mode != "simulate":
             note = f"{note};mode={self.mode}_stub"
 
-        self._append_trades_row(
+        self._update_pending_trade_row(
+            window_start,
             {
                 "signal_timestamp": trade.signal_timestamp,
                 "target_window_start": trade.target_window_start,
@@ -702,7 +743,7 @@ class DualHedgeSimulator:
                 "free_capital_after": round(free_after, 6),
                 "mode": self.mode,
                 "notes": note,
-            }
+            },
         )
 
         self.status_line = f"settled pnl={pnl:+.2f} equity=${equity_after:.2f}"

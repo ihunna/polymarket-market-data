@@ -18,20 +18,25 @@ strategies:
     max_last_delta: 0.15
     use_total_move: true
     min_total_move: 0.20
-    max_total_move: 0.80
+    max_total_move: 0.50
     use_reset_streak: true
     early_inference_threshold: 0.90
     decision_remaining_seconds: 120
     # trades file defaults to {coin}-{duration_minutes}-trades.csv
 
-  late_80:
+  opposite_side:
     enabled: true
     capital: 100.0
     investable_per_trade: 10.0
     capital_mode: locked
-    threshold_min_cents: 80
-    threshold_max_cents: 90
-    decision_remaining_seconds: 240
-    use_delta_filter: true
-    min_abs_delta: 0.15
-    trades_file: "solana-15-trades-late_80.csv"
+    limit_cents: 30
+    min_streak: 3
+    max_streak: 4
+    max_last_delta: 0.15
+    use_total_move: true
+    min_total_move: 0.01
+    max_total_move: 0.50
+    use_reset_streak: true
+    early_inference_threshold: 0.90
+    decision_remaining_seconds: 120
+    # trades file defaults to {coin}-{duration_minutes}-opposite-trades.csv

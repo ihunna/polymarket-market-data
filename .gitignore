@@ -8,8 +8,9 @@ solana-60-updown.csv
 solana-15-trades.csv
 solana-5-trades.csv
 solana-60-trades.csv
+solana-15-opposite-trades.csv
+solana-5-opposite-trades.csv
+solana-60-opposite-trades.csv
 solana-15-trades-late_80.csv
-solana-5-trades-late_80.csv
-solana-60-trades-late_80.csv
 __pycache__/
 *.pyc

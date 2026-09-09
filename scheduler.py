@@ -72,10 +72,14 @@ def format_lowest_cents(lowest_seen):
         return f"{round(lowest_seen * 100)}¢"
     return "N/A"
 
-def format_delta(value):
-    if value is None or value == float("inf") or value == float("-inf"):
-        return "N/A"
-    return f"{round(value, 6)}"
+MARKET_CSV_HEADER = [
+    "Time stamp",
+    "price_to_beat",
+    "final_price",
+    "lowest_up",
+    "lowest_down",
+    "outcome",
+]
 
 def update_window_progress(window_start, window_end, formatted_message):
     """Updates a single persistent line showing window progress and token ask data."""
@@ -99,52 +103,20 @@ def update_window_progress(window_start, window_end, formatted_message):
     sys.stdout.write("\r" + line + " " * 12)
     sys.stdout.flush()
 
-def log_to_csv(
-    timestamp,
-    price_to_beat,
-    final_price,
-    lowest_up,
-    lowest_down,
-    price_at_4min_up,
-    price_at_4min_down,
-    price_at_3min_up,
-    price_at_3min_down,
-    delta_at_4min,
-    abs_delta_at_4min,
-    delta_at_3min,
-    abs_delta_at_3min,
-    outcome,
-):
+def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, outcome):
     """Appends window results; strategy config never affects these columns."""
     filename = APP_CONFIG.get("market_data_file") or f"{COIN_NAME}-{DURATION_MINUTES}-updown.csv"
     file_exists = os.path.isfile(filename)
-    
     with open(filename, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow([
-                "Time stamp", "price_to_beat", "final_price",
-                "lowest_up", "lowest_down",
-                "price_at_4min_up", "price_at_4min_down",
-                "price_at_3min_up", "price_at_3min_down",
-                "delta_at_4min", "abs_delta_at_4min",
-                "delta_at_3min", "abs_delta_at_3min",
-                "outcome",
-            ])
+            writer.writerow(MARKET_CSV_HEADER)
         writer.writerow([
             timestamp,
             format_dollar(price_to_beat),
             format_dollar(final_price),
             lowest_up,
             lowest_down,
-            price_at_4min_up,
-            price_at_4min_down,
-            price_at_3min_up,
-            price_at_3min_down,
-            delta_at_4min,
-            abs_delta_at_4min,
-            delta_at_3min,
-            abs_delta_at_3min,
             outcome,
         ])
 
@@ -228,12 +200,6 @@ class PersistentPolymarketWS:
             if self.is_running:
                 time.sleep(2)
 
-def _snapshot_delta(price_to_beat, current_price):
-    if current_price <= 0 or price_to_beat <= 0:
-        return None, None
-    delta = current_price - price_to_beat
-    return delta, abs(delta)
-
 def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
     """Executes a window loop tracking token asks and syncing window boundary to ET/UTC epoch."""
     now_utc = calendar.timegm(time.gmtime())
@@ -268,16 +234,6 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
     
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
-    price_at_4min_up = float('inf')
-    price_at_4min_down = float('inf')
-    price_at_3min_up = float('inf')
-    price_at_3min_down = float('inf')
-    delta_at_4min = None
-    abs_delta_at_4min = None
-    delta_at_3min = None
-    abs_delta_at_3min = None
-    snapshot_4min_taken = False
-    snapshot_3min_taken = False
     initialized = False
     current_price = 0.0
     last_price_fetch_at = 0.0
@@ -316,14 +272,6 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
                 final_price,
                 format_lowest_cents(lowest_up_seen),
                 format_lowest_cents(lowest_down_seen),
-                format_lowest_cents(price_at_4min_up),
-                format_lowest_cents(price_at_4min_down),
-                format_lowest_cents(price_at_3min_up),
-                format_lowest_cents(price_at_3min_down),
-                format_delta(delta_at_4min),
-                format_delta(abs_delta_at_4min),
-                format_delta(delta_at_3min),
-                format_delta(abs_delta_at_3min),
                 outcome,
             )
 
@@ -358,28 +306,12 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
             if 0.0 < down_cost <= 1.0 and down_cost < lowest_down_seen:
                 lowest_down_seen = down_cost
 
-        need_price = (
-            (not snapshot_4min_taken and remaining <= 240)
-            or (not snapshot_3min_taken and remaining <= 180)
-            or (decision_horizon > 0 and remaining <= decision_horizon)
-        )
+        need_price = decision_horizon > 0 and remaining <= decision_horizon
         if need_price and (current_time - last_price_fetch_at) >= 2.0:
             fetched = fetch_polymarket_current_price(window_start, duration_minutes=DURATION_MINUTES)
             last_price_fetch_at = current_time
             if fetched > 0:
                 current_price = fetched
-
-        if not snapshot_4min_taken and remaining <= 240:
-            price_at_4min_up = up_cost
-            price_at_4min_down = down_cost
-            delta_at_4min, abs_delta_at_4min = _snapshot_delta(price_to_beat, current_price)
-            snapshot_4min_taken = True
-
-        if not snapshot_3min_taken and remaining <= 180:
-            price_at_3min_up = up_cost
-            price_at_3min_down = down_cost
-            delta_at_3min, abs_delta_at_3min = _snapshot_delta(price_to_beat, current_price)
-            snapshot_3min_taken = True
 
         if simulator is not None:
             simulator.on_window_update(
@@ -454,16 +386,16 @@ def parse_args():
         help="Restore dual_hedge starting equity (overrides strategies.dual_hedge.capital).",
     )
     parser.add_argument(
-        "--l8-last",
+        "--opp-last",
         type=float,
         default=None,
         metavar="EQUITY",
-        help="Restore late_80 starting equity (overrides strategies.late_80.capital).",
+        help="Restore opposite_side starting equity (overrides strategies.opposite_side.capital).",
     )
     return parser.parse_args()
 
 
-def apply_capital_overrides(config: dict, dh_last: float | None, l8_last: float | None) -> list[str]:
+def apply_capital_overrides(config: dict, dh_last: float | None, opp_last: float | None) -> list[str]:
     """Apply CLI capital restores onto strategy configs. Returns human-readable notes."""
     notes: list[str] = []
     strategies = config.setdefault("strategies", {})
@@ -476,15 +408,15 @@ def apply_capital_overrides(config: dict, dh_last: float | None, l8_last: float 
         prev = dh.get("capital")
         dh["capital"] = float(dh_last)
         notes.append(f"dual_hedge capital restored ${float(dh_last):.2f} (config was ${float(prev):.2f})")
-    if l8_last is not None:
-        if l8_last <= 0:
-            raise SystemExit("--l8-last must be > 0")
-        l80 = strategies.get("late_80")
-        if not isinstance(l80, dict):
-            raise SystemExit("--l8-last provided but strategies.late_80 is missing")
-        prev = l80.get("capital")
-        l80["capital"] = float(l8_last)
-        notes.append(f"late_80 capital restored ${float(l8_last):.2f} (config was ${float(prev):.2f})")
+    if opp_last is not None:
+        if opp_last <= 0:
+            raise SystemExit("--opp-last must be > 0")
+        opp = strategies.get("opposite_side")
+        if not isinstance(opp, dict):
+            raise SystemExit("--opp-last provided but strategies.opposite_side is missing")
+        prev = opp.get("capital")
+        opp["capital"] = float(opp_last)
+        notes.append(f"opposite_side capital restored ${float(opp_last):.2f} (config was ${float(prev):.2f})")
     return notes
 
 def resolve_duration(cli_duration, config_duration):
@@ -513,7 +445,7 @@ if __name__ == "__main__":
     DURATION_MINUTES = resolve_duration(args.duration, APP_CONFIG.get("duration_minutes"))
     WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
     APP_CONFIG = apply_duration_paths(APP_CONFIG, COIN_NAME, DURATION_MINUTES)
-    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.l8_last)
+    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last)
 
     SIMULATOR = StrategyRunner.from_config(APP_CONFIG)
     print(f"⚙️  Config loaded | mode={APP_CONFIG['mode']} | duration={DURATION_MINUTES}m")

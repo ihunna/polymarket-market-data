@@ -15,14 +15,14 @@ strategies:
     limit_cents: 30
     min_streak: 3
     max_streak: 4
-    max_last_delta: 0.15
+    max_last_delta: 0.20          # middle of 0.15 → 0.30
     use_total_move: true
-    min_total_move: 0.20
-    max_total_move: 0.50
+    min_total_move: 0.15
+    max_total_move: 0.60          # middle of 0.50 → 0.80
     use_reset_streak: true
     early_inference_threshold: 0.90
     decision_remaining_seconds: 120
-    # trades file defaults to {coin}-{duration_minutes}-trades.csv
+    # trades → {coin}-{duration}-trades.csv
 
   opposite_side:
     enabled: true
@@ -32,11 +32,11 @@ strategies:
     limit_cents: 30
     min_streak: 3
     max_streak: 4
-    max_last_delta: 0.15
+    max_last_delta: 0.20          # middle of 0.15 → 0.30
     use_total_move: true
-    min_total_move: 0.01
-    max_total_move: 0.50
+    min_total_move: 0.15
+    max_total_move: 0.70          # middle of 0.50 → 1.00
     use_reset_streak: true
     early_inference_threshold: 0.90
     decision_remaining_seconds: 120
-    # trades file defaults to {coin}-{duration_minutes}-opposite-trades.csv
+    # trades → {coin}-{duration}-opposite-trades.csv

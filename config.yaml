@@ -12,7 +12,7 @@ strategies:
     capital: 100.0
     investable_per_trade: 10.0
     capital_mode: locked
-    limit_cents: 30
+    limit_cents: 40
     min_streak: 3
     max_streak: 4
     max_last_delta: 0.20          # middle of 0.15 → 0.30
@@ -29,7 +29,7 @@ strategies:
     capital: 100.0
     investable_per_trade: 10.0
     capital_mode: locked
-    limit_cents: 30
+    limit_cents: 40
     min_streak: 3
     max_streak: 4
     max_last_delta: 0.20          # middle of 0.15 → 0.30

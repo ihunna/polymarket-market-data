@@ -5,38 +5,58 @@ duration_minutes: 15
 # Global
 mode: simulate                    # simulate | paper | live
 
+market_bias:
+  # off | ref | rolling | ema
+  mode: rolling
+  # ref mode
+  reference_price: null          # float, e.g. 107.0
+  ref_set_timestamp: null        # unix int when ref was set; optional
+  max_ref_age_windows: 250
+  # rolling mode (default)
+  lookback_windows: 96           # 1 day of 15m bars
+  # ema mode
+  ema_period: 96
+  ema_band: 0.75
+  # shared
+  strong_move: 1.5
+
 # Strategies
 strategies:
   dual_hedge:
     enabled: true
     capital: 100.0
-    investable_per_trade: 10.0
+    investable_per_trade: 5.0
     capital_mode: locked
-    limit_cents: 40
+    limit_cents: 30
     min_streak: 3
     max_streak: 4
-    max_last_delta: 0.20          # middle of 0.15 → 0.30
+    max_last_delta: 0.20
     use_total_move: true
     min_total_move: 0.15
-    max_total_move: 0.60          # middle of 0.50 → 0.80
+    max_total_move: 0.60
     use_reset_streak: true
     early_inference_threshold: 0.90
-    decision_remaining_seconds: 120
+    decision_remaining_seconds: 60
+    skip_in_flat: true
+    flat_short_lookback: 20
+    flat_short_max: 0.30
     # trades → {coin}-{duration}-trades.csv
 
   opposite_side:
     enabled: true
     capital: 100.0
-    investable_per_trade: 10.0
+    investable_per_trade: 5.0
     capital_mode: locked
-    limit_cents: 40
+    limit_cents: 30
     min_streak: 3
     max_streak: 4
-    max_last_delta: 0.20          # middle of 0.15 → 0.30
+    max_last_delta: 0.15
     use_total_move: true
-    min_total_move: 0.15
-    max_total_move: 0.70          # middle of 0.50 → 1.00
+    min_total_move: 0.20
+    max_total_move: 0.50
     use_reset_streak: true
     early_inference_threshold: 0.90
-    decision_remaining_seconds: 120
+    decision_remaining_seconds: 60
+    skip_buy_up_when_bearish: true
+    skip_buy_down_when_bullish: true
     # trades → {coin}-{duration}-opposite-trades.csv

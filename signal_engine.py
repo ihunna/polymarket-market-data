@@ -37,6 +37,10 @@ TRADES_HEADER = [
     "free_capital_after",
     "mode",
     "notes",
+    "bias",
+    "move_amount",
+    "regime_mode",
+    "setup_direction",
 ]
 
 OPPOSITE_TRADES_HEADER = [
@@ -64,9 +68,14 @@ OPPOSITE_TRADES_HEADER = [
     "free_capital_after",
     "mode",
     "notes",
+    "bias",
+    "move_amount",
+    "regime_mode",
 ]
 
 HISTORY_LIMIT = 20
+REGIME_HISTORY_LIMIT = 400
+VALID_BIAS_MODES = ("off", "ref", "rolling", "ema")
 
 DUAL_HEDGE_REQUIRED = [
     "enabled",
@@ -175,6 +184,17 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
             raise ValueError(f"strategies.opposite_side missing keys: {miss}")
         if opp["capital_mode"] not in ("locked", "unlocked"):
             raise ValueError("strategies.opposite_side.capital_mode must be 'locked' or 'unlocked'")
+
+    market_bias = data.get("market_bias")
+    if market_bias is None:
+        data["market_bias"] = {"mode": "off"}
+    elif not isinstance(market_bias, dict):
+        raise ValueError("market_bias must be a mapping")
+    else:
+        mode = str(market_bias.get("mode") or "off").strip().lower()
+        if mode not in VALID_BIAS_MODES:
+            raise ValueError("market_bias.mode must be one of: off, ref, rolling, ema")
+        market_bias["mode"] = mode
 
     data["_config_duration_minutes"] = int(data["duration_minutes"])
     return apply_duration_paths(data, str(data["coin"]), int(data["duration_minutes"]))
@@ -330,7 +350,293 @@ def seed_history_from_csv(market_data_file: str) -> list[WindowRecord]:
         return []
 
     records.sort(key=lambda r: r.window_start)
-    return records[-HISTORY_LIMIT:]
+    return records[-REGIME_HISTORY_LIMIT:]
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _signed_bias(move: float, threshold: float) -> str:
+    if move <= -threshold:
+        return "bearish"
+    if move >= threshold:
+        return "bullish"
+    return "neutral"
+
+
+def _regime_row_fields(
+    regime: RegimeEngine | None,
+    current_price: float | None = None,
+) -> dict[str, Any]:
+    if regime is None or regime.mode == "off":
+        return {"bias": "", "move_amount": "", "regime_mode": ""}
+    state = regime.get_state(current_price)
+    return {
+        "bias": state.bias,
+        "move_amount": round(state.move_amount, 6),
+        "regime_mode": state.mode,
+    }
+
+
+@dataclass
+class RegimeState:
+    bias: str
+    move_amount: float
+    mode: str
+    ema_value: float | None = None
+    reference_price: float | None = None
+    ref_age_windows: int | None = None
+
+
+class RegimeEngine:
+    def __init__(
+        self,
+        mode: str = "off",
+        duration_seconds: int = 900,
+        reference_price: float | None = None,
+        ref_set_timestamp: int | None = None,
+        max_ref_age_windows: int = 250,
+        lookback_windows: int = 96,
+        ema_period: int = 96,
+        ema_band: float = 0.75,
+        strong_move: float = 1.5,
+    ):
+        self.mode = mode if mode in VALID_BIAS_MODES else "off"
+        self.duration_seconds = int(duration_seconds) if duration_seconds else 900
+        self.reference_price = reference_price
+        self.ref_set_timestamp = ref_set_timestamp
+        self.max_ref_age_windows = int(max_ref_age_windows)
+        self.lookback_windows = int(lookback_windows)
+        self.ema_period = max(1, int(ema_period))
+        self.ema_band = float(ema_band)
+        self.strong_move = float(strong_move)
+
+        self.prices: list[float] = []
+        self.window_starts: list[int] = []
+        self.ema_value: float | None = None
+        self._runtime_updates = 0
+        self._seeding = False
+        self._logged_null_ref = False
+        self._logged_stale = False
+
+        if self.mode == "ref" and self.reference_price is None:
+            self._log_null_ref()
+
+    def _log_null_ref(self) -> None:
+        if self._logged_null_ref:
+            return
+        self._logged_null_ref = True
+        print("⚠️  market_bias.mode=ref but reference_price is null; bias always neutral")
+
+    def _log_stale(self, age: int) -> None:
+        if self._logged_stale:
+            return
+        self._logged_stale = True
+        print(f"⚠️  REF_STALE age={age} max={self.max_ref_age_windows}")
+
+    @classmethod
+    def from_config(cls, market_bias: dict[str, Any], duration_seconds: int) -> RegimeEngine:
+        cfg = market_bias or {}
+        mode = str(cfg.get("mode") or "off").strip().lower()
+        if mode not in VALID_BIAS_MODES:
+            mode = "off"
+        return cls(
+            mode=mode,
+            duration_seconds=int(duration_seconds),
+            reference_price=_optional_float(cfg.get("reference_price")),
+            ref_set_timestamp=_optional_int(cfg.get("ref_set_timestamp")),
+            max_ref_age_windows=int(cfg.get("max_ref_age_windows", 250)),
+            lookback_windows=int(cfg.get("lookback_windows", 96)),
+            ema_period=int(cfg.get("ema_period", 96)),
+            ema_band=float(cfg.get("ema_band", 0.75)),
+            strong_move=float(cfg.get("strong_move", 1.5)),
+        )
+
+    def _apply_ema(self, price: float) -> None:
+        if self.ema_value is None:
+            self.ema_value = price
+            return
+        alpha = 2.0 / (self.ema_period + 1)
+        self.ema_value = alpha * price + (1.0 - alpha) * self.ema_value
+
+    def _peek_ema(self, price: float) -> float:
+        if self.ema_value is None:
+            return price
+        alpha = 2.0 / (self.ema_period + 1)
+        return alpha * price + (1.0 - alpha) * self.ema_value
+
+    def _rebuild_ema(self) -> None:
+        self.ema_value = None
+        for price in self.prices:
+            self._apply_ema(price)
+
+    def _trim_prices(self) -> None:
+        overflow = len(self.prices) - REGIME_HISTORY_LIMIT
+        if overflow > 0:
+            del self.prices[:overflow]
+            del self.window_starts[:overflow]
+            self._rebuild_ema()
+
+    def seed_from_history(self, records: list[WindowRecord]) -> None:
+        self.prices = []
+        self.window_starts = []
+        self.ema_value = None
+        self._runtime_updates = 0
+        self._seeding = True
+        try:
+            for rec in records:
+                if rec.final_price > 0:
+                    self.update(rec.final_price, rec.window_start)
+        finally:
+            self._seeding = False
+
+    def update(self, final_price: float, window_start: int) -> None:
+        if final_price <= 0:
+            return
+        price = float(final_price)
+        ws = int(window_start)
+        if self.window_starts and self.window_starts[-1] == ws:
+            self.prices[-1] = price
+            self._rebuild_ema()
+        else:
+            self.prices.append(price)
+            self.window_starts.append(ws)
+            self._apply_ema(price)
+            if not self._seeding:
+                self._runtime_updates += 1
+        self._trim_prices()
+
+    def _ref_age_windows(self) -> int:
+        if self.ref_set_timestamp is not None and self.duration_seconds > 0:
+            ref_window = (
+                int(self.ref_set_timestamp) // self.duration_seconds
+            ) * self.duration_seconds
+            if self.window_starts:
+                now_window = self.window_starts[-1]
+            else:
+                now_window = (int(time.time()) // self.duration_seconds) * self.duration_seconds
+            return max(0, int((now_window - ref_window) / self.duration_seconds))
+        return self._runtime_updates
+
+    def get_state(self, current_price: float | None = None) -> RegimeState:
+        mode = self.mode
+        if mode == "off":
+            return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
+
+        pending = current_price is not None and current_price > 0
+        if pending:
+            current = float(current_price)
+        elif self.prices:
+            current = self.prices[-1]
+        else:
+            current = None
+
+        if mode == "ref":
+            age = self._ref_age_windows()
+            if self.reference_price is None:
+                self._log_null_ref()
+                return RegimeState(
+                    bias="neutral",
+                    move_amount=0.0,
+                    mode=mode,
+                    reference_price=None,
+                    ref_age_windows=age,
+                )
+            if current is None:
+                return RegimeState(
+                    bias="neutral",
+                    move_amount=0.0,
+                    mode=mode,
+                    reference_price=self.reference_price,
+                    ref_age_windows=age,
+                )
+            move = current - self.reference_price
+            if age > self.max_ref_age_windows:
+                self._log_stale(age)
+                return RegimeState(
+                    bias="neutral",
+                    move_amount=move,
+                    mode=mode,
+                    reference_price=self.reference_price,
+                    ref_age_windows=age,
+                )
+            return RegimeState(
+                bias=_signed_bias(move, self.strong_move),
+                move_amount=move,
+                mode=mode,
+                reference_price=self.reference_price,
+                ref_age_windows=age,
+            )
+
+        if mode == "rolling":
+            lookback = self.lookback_windows
+            if current is None:
+                return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
+            if pending:
+                if len(self.prices) < lookback:
+                    return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
+                older = self.prices[-lookback]
+            else:
+                if len(self.prices) < lookback + 1:
+                    return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
+                older = self.prices[-1 - lookback]
+            move = current - older
+            return RegimeState(
+                bias=_signed_bias(move, self.strong_move),
+                move_amount=move,
+                mode=mode,
+            )
+
+        if mode == "ema":
+            if current is None:
+                return RegimeState(
+                    bias="neutral",
+                    move_amount=0.0,
+                    mode=mode,
+                    ema_value=self.ema_value,
+                )
+            if pending or self.ema_value is None:
+                ema_now = self._peek_ema(current)
+            else:
+                ema_now = self.ema_value
+            diff = current - ema_now
+            return RegimeState(
+                bias=_signed_bias(diff, self.ema_band),
+                move_amount=diff,
+                mode=mode,
+                ema_value=ema_now,
+            )
+
+        return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
+
+    def summarize_line(self) -> str:
+        state = self.get_state()
+        extra = ""
+        if self.mode == "rolling":
+            extra = f" lookback={self.lookback_windows}"
+        elif self.mode == "ema":
+            if state.ema_value is not None:
+                extra = f" ema={state.ema_value:.2f} band={self.ema_band}"
+        elif self.mode == "ref":
+            extra = f" ref={state.reference_price}" if state.reference_price is not None else " ref=null"
+            if state.ref_age_windows is not None:
+                extra += f" age={state.ref_age_windows}"
+        return f"regime: mode={state.mode} bias={state.bias} move={state.move_amount:.2f}{extra}"
 
 
 @dataclass
@@ -353,6 +659,7 @@ class OpenTrade:
     entry_up: float | None = None
     entry_down: float | None = None
     notes: str = "pending"
+    setup_direction: str = ""
 
 
 @dataclass
@@ -383,6 +690,7 @@ class DualHedgeSimulator:
         global_config: dict[str, Any],
         strategy_config: dict[str, Any],
         history: list[WindowRecord] | None = None,
+        regime: RegimeEngine | None = None,
     ):
         self.duration_minutes = int(global_config["duration_minutes"])
         self.duration_seconds = self.duration_minutes * 60
@@ -403,6 +711,10 @@ class DualHedgeSimulator:
         self.limit_cents = int(cfg["limit_cents"])
         self.limit_price = self.limit_cents / 100.0
         self.trades_log_file = str(cfg.get("trades_log_file") or global_config.get("trades_log_file"))
+        self.skip_in_flat = bool(cfg.get("skip_in_flat", False))
+        self.flat_short_lookback = int(cfg.get("flat_short_lookback", 20))
+        self.flat_short_max = float(cfg.get("flat_short_max", 0.30))
+        self.regime = regime
 
         self.capital = CapitalManager(
             total_capital=float(cfg["capital"]),
@@ -410,8 +722,9 @@ class DualHedgeSimulator:
             capital_mode=str(cfg["capital_mode"]),
         )
 
-        self.history: list[WindowRecord] = list(history) if history is not None else []
-        if history is None:
+        if history is not None:
+            self.history = history
+        else:
             self.history = seed_history_from_csv(self.market_data_file)
 
         self.open_trades: dict[int, OpenTrade] = {}
@@ -455,14 +768,30 @@ class DualHedgeSimulator:
                 writer.writerow({k: row.get(k, "") for k in TRADES_HEADER})
         os.replace(tmp_path, path)
 
-    def _append_trades_row(self, row: dict[str, Any]) -> None:
+    def _with_regime_fields(
+        self,
+        row: dict[str, Any],
+        current_price: float | None = None,
+        setup_direction: str | None = None,
+    ) -> dict[str, Any]:
+        filled = dict(_regime_row_fields(self.regime, current_price))
+        filled.update(row)
+        if setup_direction is not None:
+            filled["setup_direction"] = setup_direction or ""
+        elif "setup_direction" not in filled:
+            filled["setup_direction"] = ""
+        return filled
+
+    def _append_trades_row(self, row: dict[str, Any], current_price: float | None = None) -> None:
         self._ensure_trades_header()
+        filled = self._with_regime_fields(row, current_price=current_price)
         with open(self.trades_log_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=TRADES_HEADER, extrasaction="ignore")
-            writer.writerow({k: row.get(k, "") for k in TRADES_HEADER})
+            writer.writerow({k: filled.get(k, "") for k in TRADES_HEADER})
 
     def _update_pending_trade_row(self, target_window_start: int, row: dict[str, Any]) -> None:
         self._ensure_trades_header()
+        filled = self._with_regime_fields(row)
         rows = self._read_trades_rows()
         target_key = str(target_window_start)
         updated = False
@@ -472,11 +801,11 @@ class DualHedgeSimulator:
                 continue
             fill = str(existing.get("fill_type", "")).strip().lower()
             if fill in ("pending", ""):
-                rows[i] = {k: row.get(k, "") for k in TRADES_HEADER}
+                rows[i] = {k: filled.get(k, "") for k in TRADES_HEADER}
                 updated = True
                 break
         if not updated:
-            rows.append({k: row.get(k, "") for k in TRADES_HEADER})
+            rows.append({k: filled.get(k, "") for k in TRADES_HEADER})
         self._write_trades_rows(rows)
 
     def _target_slug(self, target_window_start: int) -> str:
@@ -488,8 +817,9 @@ class DualHedgeSimulator:
             self.history[-1] = record
         else:
             self.history.append(record)
-        if len(self.history) > HISTORY_LIMIT:
-            self.history = self.history[-HISTORY_LIMIT:]
+        overflow = len(self.history) - REGIME_HISTORY_LIMIT
+        if overflow > 0:
+            del self.history[:overflow]
 
     def _print_event(self, message: str) -> None:
         sys.stdout.write("\n" + message + "\n")
@@ -580,6 +910,8 @@ class DualHedgeSimulator:
         free_before: float,
         locked_before: float,
         equity_before: float,
+        setup_direction: str | None = None,
+        current_price: float | None = None,
     ) -> None:
         self._append_trades_row(
             {
@@ -608,7 +940,9 @@ class DualHedgeSimulator:
                 "free_capital_after": round(free_before, 6),
                 "mode": self.mode,
                 "notes": reason,
-            }
+                "setup_direction": setup_direction or "",
+            },
+            current_price=current_price,
         )
         self.status_line = f"dh skip last={abs_delta:.2f}"
         self._print_event(
@@ -657,9 +991,36 @@ class DualHedgeSimulator:
             )
             return None
 
+        setup_direction = str(evaluation.get("direction") or "")
         free_before = self.capital.free_capital
         locked_before = self.capital.locked_capital
         equity_before = self.capital.equity
+
+        if self.skip_in_flat and self.regime is not None:
+            state = self.regime.get_state(final_price)
+            if state.bias == "neutral":
+                lookback = self.flat_short_lookback
+                price_n_ago = None
+                if len(eval_history) > lookback:
+                    price_n_ago = eval_history[-1 - lookback].final_price
+                if price_n_ago is not None:
+                    short_move = abs(final_price - price_n_ago)
+                    if short_move < self.flat_short_max:
+                        self._log_skip(
+                            setup_window_start,
+                            target_window_start,
+                            slug,
+                            streak_len,
+                            abs_delta,
+                            total_move,
+                            f"flat_skip bias=neutral short={short_move:.2f}",
+                            free_before,
+                            locked_before,
+                            equity_before,
+                            setup_direction=setup_direction,
+                            current_price=final_price,
+                        )
+                        return None
 
         contracts = self.capital.calculate_contracts(self.limit_cents)
         required_cost = self.capital.required_cost(contracts, self.limit_cents)
@@ -676,6 +1037,8 @@ class DualHedgeSimulator:
                 free_before,
                 locked_before,
                 equity_before,
+                setup_direction=setup_direction,
+                current_price=final_price,
             )
             return None
 
@@ -692,6 +1055,8 @@ class DualHedgeSimulator:
                 free_before,
                 locked_before,
                 equity_before,
+                setup_direction=setup_direction,
+                current_price=final_price,
             )
             return None
 
@@ -715,6 +1080,7 @@ class DualHedgeSimulator:
             invested_amount=round(required_cost, 6),
             contracts=contracts,
             notes=note,
+            setup_direction=setup_direction,
         )
         self.open_trades[target_window_start] = trade
 
@@ -745,7 +1111,9 @@ class DualHedgeSimulator:
                 "free_capital_after": "",
                 "mode": self.mode,
                 "notes": trade.notes,
-            }
+                "setup_direction": trade.setup_direction,
+            },
+            current_price=final_price,
         )
 
         self.status_line = f"dh open last={abs_delta:.2f}"
@@ -848,6 +1216,7 @@ class DualHedgeSimulator:
                 "free_capital_after": round(free_after, 6),
                 "mode": self.mode,
                 "notes": note,
+                "setup_direction": trade.setup_direction,
             },
         )
 
@@ -959,6 +1328,7 @@ class OppositeSideSimulator:
         global_config: dict[str, Any],
         strategy_config: dict[str, Any],
         history: list[WindowRecord] | None = None,
+        regime: RegimeEngine | None = None,
     ):
         self.duration_minutes = int(global_config["duration_minutes"])
         self.duration_seconds = self.duration_minutes * 60
@@ -982,6 +1352,9 @@ class OppositeSideSimulator:
             cfg.get("trades_log_file")
             or opposite_trades_path(self.coin, self.duration_minutes)
         )
+        self.skip_buy_up_when_bearish = bool(cfg.get("skip_buy_up_when_bearish", True))
+        self.skip_buy_down_when_bullish = bool(cfg.get("skip_buy_down_when_bullish", True))
+        self.regime = regime
 
         self.capital = CapitalManager(
             total_capital=float(cfg["capital"]),
@@ -989,8 +1362,9 @@ class OppositeSideSimulator:
             capital_mode=str(cfg["capital_mode"]),
         )
 
-        self.history: list[WindowRecord] = list(history) if history is not None else []
-        if history is None:
+        if history is not None:
+            self.history = history
+        else:
             self.history = seed_history_from_csv(self.market_data_file)
 
         self.open_trades: dict[int, OppositeOpenTrade] = {}
@@ -1034,14 +1408,25 @@ class OppositeSideSimulator:
                 writer.writerow({k: row.get(k, "") for k in OPPOSITE_TRADES_HEADER})
         os.replace(tmp_path, path)
 
-    def _append_trades_row(self, row: dict[str, Any]) -> None:
+    def _with_regime_fields(
+        self,
+        row: dict[str, Any],
+        current_price: float | None = None,
+    ) -> dict[str, Any]:
+        filled = dict(_regime_row_fields(self.regime, current_price))
+        filled.update(row)
+        return filled
+
+    def _append_trades_row(self, row: dict[str, Any], current_price: float | None = None) -> None:
         self._ensure_trades_header()
+        filled = self._with_regime_fields(row, current_price=current_price)
         with open(self.trades_log_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=OPPOSITE_TRADES_HEADER, extrasaction="ignore")
-            writer.writerow({k: row.get(k, "") for k in OPPOSITE_TRADES_HEADER})
+            writer.writerow({k: filled.get(k, "") for k in OPPOSITE_TRADES_HEADER})
 
     def _update_pending_trade_row(self, target_window_start: int, row: dict[str, Any]) -> None:
         self._ensure_trades_header()
+        filled = self._with_regime_fields(row)
         rows = self._read_trades_rows()
         target_key = str(target_window_start)
         updated = False
@@ -1051,11 +1436,11 @@ class OppositeSideSimulator:
                 continue
             fill = str(existing.get("fill_type", "")).strip().lower()
             if fill in ("pending", ""):
-                rows[i] = {k: row.get(k, "") for k in OPPOSITE_TRADES_HEADER}
+                rows[i] = {k: filled.get(k, "") for k in OPPOSITE_TRADES_HEADER}
                 updated = True
                 break
         if not updated:
-            rows.append({k: row.get(k, "") for k in OPPOSITE_TRADES_HEADER})
+            rows.append({k: filled.get(k, "") for k in OPPOSITE_TRADES_HEADER})
         self._write_trades_rows(rows)
 
     def _target_slug(self, target_window_start: int) -> str:
@@ -1067,8 +1452,9 @@ class OppositeSideSimulator:
             self.history[-1] = record
         else:
             self.history.append(record)
-        if len(self.history) > HISTORY_LIMIT:
-            self.history = self.history[-HISTORY_LIMIT:]
+        overflow = len(self.history) - REGIME_HISTORY_LIMIT
+        if overflow > 0:
+            del self.history[:overflow]
 
     def _print_event(self, message: str) -> None:
         sys.stdout.write("\n" + message + "\n")
@@ -1156,6 +1542,7 @@ class OppositeSideSimulator:
         locked_before: float,
         equity_before: float,
         side: str = "",
+        current_price: float | None = None,
     ) -> None:
         self._append_trades_row(
             {
@@ -1183,7 +1570,8 @@ class OppositeSideSimulator:
                 "free_capital_after": round(free_before, 6),
                 "mode": self.mode,
                 "notes": reason,
-            }
+            },
+            current_price=current_price,
         )
         self.status_line = f"opp skip last={abs_delta:.2f}"
         self._print_event(
@@ -1238,6 +1626,43 @@ class OppositeSideSimulator:
         locked_before = self.capital.locked_capital
         equity_before = self.capital.equity
 
+        if self.regime is not None:
+            state = self.regime.get_state(final_price)
+            if state.bias == "bearish" and side == "Up" and self.skip_buy_up_when_bearish:
+                self._log_skip(
+                    setup_window_start,
+                    target_window_start,
+                    slug,
+                    streak_len,
+                    setup_direction,
+                    abs_delta,
+                    total_move,
+                    f"regime_block bias={state.bias} side={side} move={state.move_amount:.2f}",
+                    free_before,
+                    locked_before,
+                    equity_before,
+                    side=side,
+                    current_price=final_price,
+                )
+                return None
+            if state.bias == "bullish" and side == "Down" and self.skip_buy_down_when_bullish:
+                self._log_skip(
+                    setup_window_start,
+                    target_window_start,
+                    slug,
+                    streak_len,
+                    setup_direction,
+                    abs_delta,
+                    total_move,
+                    f"regime_block bias={state.bias} side={side} move={state.move_amount:.2f}",
+                    free_before,
+                    locked_before,
+                    equity_before,
+                    side=side,
+                    current_price=final_price,
+                )
+                return None
+
         contracts = self.capital.calculate_contracts_single(self.limit_price)
         required_cost = self.capital.required_cost_single(contracts, self.limit_price)
 
@@ -1255,6 +1680,7 @@ class OppositeSideSimulator:
                 locked_before,
                 equity_before,
                 side=side,
+                current_price=final_price,
             )
             return None
 
@@ -1273,6 +1699,7 @@ class OppositeSideSimulator:
                 locked_before,
                 equity_before,
                 side=side,
+                current_price=final_price,
             )
             return None
 
@@ -1327,7 +1754,8 @@ class OppositeSideSimulator:
                 "free_capital_after": "",
                 "mode": self.mode,
                 "notes": trade.notes,
-            }
+            },
+            current_price=final_price,
         )
 
         self.status_line = f"opp open {side} last={abs_delta:.2f}"
@@ -1519,33 +1947,52 @@ class OppositeSideSimulator:
 class StrategyRunner:
     """Fan-out window events to enabled independent strategies."""
 
-    def __init__(self, strategies: list[Any], decision_remaining_seconds: float = 0.0):
+    def __init__(
+        self,
+        strategies: list[Any],
+        decision_remaining_seconds: float = 0.0,
+        regime: RegimeEngine | None = None,
+        history: list[WindowRecord] | None = None,
+    ):
         self.strategies = strategies
         self.decision_remaining_seconds = float(decision_remaining_seconds)
-        self.history: list[WindowRecord] = []
-        for s in strategies:
-            if hasattr(s, "history"):
-                self.history = s.history
-                break
+        self.regime = regime
+        self.history: list[WindowRecord] = history if history is not None else []
+        if not self.history:
+            for s in strategies:
+                if hasattr(s, "history"):
+                    self.history = s.history
+                    break
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> StrategyRunner:
         strategies_cfg = config.get("strategies") or {}
         history = seed_history_from_csv(str(config["market_data_file"]))
+        duration_seconds = int(config["duration_minutes"]) * 60
+        regime = RegimeEngine.from_config(
+            config.get("market_bias") or {},
+            duration_seconds=duration_seconds,
+        )
+        regime.seed_from_history(history)
         enabled: list[Any] = []
         max_decision = 0.0
 
         dh_cfg = strategies_cfg.get("dual_hedge")
         if isinstance(dh_cfg, dict) and dh_cfg.get("enabled"):
-            enabled.append(DualHedgeSimulator(config, dh_cfg, history=list(history)))
+            enabled.append(DualHedgeSimulator(config, dh_cfg, history=history, regime=regime))
             max_decision = max(max_decision, float(dh_cfg.get("decision_remaining_seconds", 0)))
 
         opp_cfg = strategies_cfg.get("opposite_side")
         if isinstance(opp_cfg, dict) and opp_cfg.get("enabled"):
-            enabled.append(OppositeSideSimulator(config, opp_cfg, history=list(history)))
+            enabled.append(OppositeSideSimulator(config, opp_cfg, history=history, regime=regime))
             max_decision = max(max_decision, float(opp_cfg.get("decision_remaining_seconds", 0)))
 
-        return cls(enabled, decision_remaining_seconds=max_decision)
+        return cls(
+            enabled,
+            decision_remaining_seconds=max_decision,
+            regime=regime,
+            history=history,
+        )
 
     def display_status(self, window_start: int | None = None) -> str:
         parts = [s.display_status(window_start) for s in self.strategies]
@@ -1558,9 +2005,15 @@ class StrategyRunner:
     def on_window_close(self, **kwargs: Any) -> None:
         for s in self.strategies:
             s.on_window_close(**kwargs)
+        final_price = kwargs.get("final_price", 0) or 0
+        window_start = kwargs.get("window_start")
+        if self.regime and final_price > 0 and window_start is not None:
+            self.regime.update(float(final_price), int(window_start))
 
     def summarize(self) -> str:
         lines = []
+        if self.regime is not None:
+            lines.append(f"  {self.regime.summarize_line()}")
         for s in self.strategies:
             if isinstance(s, DualHedgeSimulator):
                 lines.append(

@@ -1,1 +1,6 @@
-signal_timestamp,capital_before,notes
+signal_timestamp,target_window_start,slug,setup_window_start,setup_streak,setup_abs_delta,setup_total_move,limit_cents,capital_before,free_capital_before,locked_capital_before,invested_amount,contracts,up_filled,down_filled,fill_type,entry_up,entry_down,exit_up,exit_down,pnl,capital_after,free_capital_after,mode,notes
+1788723002,1788723000,sol-updown-15m-1788723000,1788722100,3,0.054956,0.614956,30,100.0,100.0,0.0,9.6,16,,,pending,,,,,,,,simulate,pending
+1788723002,1788723000,sol-updown-15m-1788723000,1788722100,3,0.054956,0.614956,30,100.0,100.0,0.0,9.6,16,True,False,only_up,0.3,,0.0,,-4.8,95.2,95.2,simulate,settled
+1788743727,1788743700,sol-updown-15m-1788743700,1788742800,4,0.069053,0.491149,30,100.0,100.0,0.0,9.6,16,,,pending,,,,,,,,simulate,pending
+1788743727,1788743700,sol-updown-15m-1788743700,1788742800,4,0.069053,0.491149,30,100.0,100.0,0.0,9.6,16,True,True,both,0.3,0.3,1.0,0.0,6.4,106.4,106.4,simulate,settled
+1788789509,1788789600,sol-updown-15m-1788789600,1788788700,4,0.034755,0.613671,30,100.0,100.0,0.0,9.6,16,True,True,both,0.3,0.3,0.0,1.0,6.4,106.4,106.4,simulate,settled

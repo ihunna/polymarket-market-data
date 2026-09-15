@@ -392,6 +392,20 @@ def parse_args():
         metavar="EQUITY",
         help="Restore opposite_side starting equity (overrides strategies.opposite_side.capital).",
     )
+    parser.add_argument(
+        "--ref-price",
+        type=float,
+        default=None,
+        metavar="FLOAT",
+        help="Set market_bias.mode=ref and reference_price.",
+    )
+    parser.add_argument(
+        "--bias-mode",
+        type=str,
+        default=None,
+        choices=("off", "ref", "rolling", "ema"),
+        help="Override market_bias.mode (off|ref|rolling|ema).",
+    )
     return parser.parse_args()
 
 
@@ -417,6 +431,23 @@ def apply_capital_overrides(config: dict, dh_last: float | None, opp_last: float
         prev = opp.get("capital")
         opp["capital"] = float(opp_last)
         notes.append(f"opposite_side capital restored ${float(opp_last):.2f} (config was ${float(prev):.2f})")
+    return notes
+
+
+def apply_bias_overrides(config: dict, ref_price: float | None, bias_mode: str | None) -> list[str]:
+    """Apply CLI market_bias overrides after load_config. Returns human-readable notes."""
+    notes: list[str] = []
+    mb = config.get("market_bias")
+    if not isinstance(mb, dict):
+        mb = {"mode": "off"}
+        config["market_bias"] = mb
+    if bias_mode is not None:
+        mb["mode"] = bias_mode
+        notes.append(f"market_bias.mode overridden to {bias_mode}")
+    if ref_price is not None:
+        mb["mode"] = "ref"
+        mb["reference_price"] = float(ref_price)
+        notes.append(f"market_bias.mode=ref reference_price={float(ref_price)}")
     return notes
 
 def resolve_duration(cli_duration, config_duration):
@@ -446,11 +477,16 @@ if __name__ == "__main__":
     WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
     APP_CONFIG = apply_duration_paths(APP_CONFIG, COIN_NAME, DURATION_MINUTES)
     restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last)
+    bias_notes = apply_bias_overrides(APP_CONFIG, args.ref_price, args.bias_mode)
 
     SIMULATOR = StrategyRunner.from_config(APP_CONFIG)
     print(f"⚙️  Config loaded | mode={APP_CONFIG['mode']} | duration={DURATION_MINUTES}m")
     for note in restore_notes:
         print(f"💰 {note}")
+    for note in bias_notes:
+        print(f"📐 {note}")
     print(SIMULATOR.summarize())
+    if getattr(SIMULATOR, "regime", None) is not None:
+        print(SIMULATOR.regime.summarize_line())
     print(f"📁 market={APP_CONFIG['market_data_file']}")
     start_aligned_runner(simulator=SIMULATOR)

@@ -23,7 +23,7 @@ market_bias:
 # Strategies
 strategies:
   dual_hedge:
-    enabled: true
+    enabled: false
     capital: 100.0
     investable_per_trade: 5.0
     capital_mode: locked
@@ -50,13 +50,13 @@ strategies:
     limit_cents: 30
     min_streak: 3
     max_streak: 4
-    max_last_delta: 0.15
+    max_last_delta: 0.08
     use_total_move: true
     min_total_move: 0.20
     max_total_move: 0.50
     use_reset_streak: true
     early_inference_threshold: 0.90
     decision_remaining_seconds: 60
-    skip_buy_up_when_bearish: true
-    skip_buy_down_when_bullish: true
+    skip_buy_up_when_bearish: false
+    skip_buy_down_when_bullish: false
     # trades → {coin}-{duration}-opposite-trades.csv

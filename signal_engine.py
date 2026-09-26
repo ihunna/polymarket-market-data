@@ -2079,6 +2079,7 @@ class FlatDualSimulator:
         self.open_trades: dict[int, FlatDualOpenTrade] = {}
         self._decided_windows: set[int] = set()
         self._gaps: dict[int, dict[str, float]] = {}
+        self._first_seen: dict[int, float] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
         self.status_line = "fd: idle"
@@ -2149,8 +2150,8 @@ class FlatDualSimulator:
                 "binance_gap_at_entry": self._binance_gap(price_to_beat),
                 "max_move": self.max_move,
                 "limit_cents": self.limit_cents,
-                "up_ask_at_entry": up_ask,
-                "down_ask_at_entry": down_ask,
+                "up_ask_at_entry": round(up_ask, 2),
+                "down_ask_at_entry": round(down_ask, 2),
                 "capital_before": round(self.capital.equity, 2),
                 "free_capital_before": round(self.capital.free_capital, 2),
                 "locked_capital_before": round(self.capital.locked_capital, 2),
@@ -2176,6 +2177,14 @@ class FlatDualSimulator:
         down_ask: float,
     ) -> None:
         if window_start in self._decided_windows or remaining > self.decision_remaining_seconds:
+            return
+
+        first_seen = self._first_seen.get(window_start, remaining)
+        if first_seen < self.decision_remaining_seconds - self.decision_tolerance_seconds:
+            self._decided_windows.add(window_start)
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask, "late_start"
+            )
             return
 
         asks_ok = 0.0 < up_ask < 1.0 and 0.0 < down_ask < 1.0
@@ -2322,6 +2331,7 @@ class FlatDualSimulator:
         **_: Any,
     ) -> None:
         self._binance_price = binance_price
+        self._first_seen.setdefault(window_start, remaining_seconds)
         self._track_gap(window_start, price_to_beat, current_price)
         trade = self.open_trades.get(window_start)
         if trade is not None:
@@ -2342,6 +2352,7 @@ class FlatDualSimulator:
         gap_fields = self._gap_fields(window_start, price_to_beat, final_price)
         self._decided_windows = {w for w in self._decided_windows if w >= window_start}
         self._gaps = {w: g for w, g in self._gaps.items() if w > window_start}
+        self._first_seen = {w: s for w, s in self._first_seen.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)
             skip_row["outcome"] = outcome
@@ -2382,8 +2393,8 @@ class FlatDualSimulator:
                 "binance_gap_at_entry": trade.binance_gap,
                 "max_move": self.max_move,
                 "limit_cents": self.limit_cents,
-                "up_ask_at_entry": trade.up_ask_at_entry,
-                "down_ask_at_entry": trade.down_ask_at_entry,
+                "up_ask_at_entry": round(trade.up_ask_at_entry, 2),
+                "down_ask_at_entry": round(trade.down_ask_at_entry, 2),
                 "entry_mode": trade.entry_mode,
                 "capital_before": trade.capital_before,
                 "free_capital_before": trade.free_capital_before,

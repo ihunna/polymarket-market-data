@@ -90,6 +90,8 @@ FLAT_DUAL_TRADES_HEADER = [
     "limit_cents",
     "up_ask_at_entry",
     "down_ask_at_entry",
+    "up_ask_at_end",
+    "down_ask_at_end",
     "entry_mode",
     "capital_before",
     "free_capital_before",
@@ -2066,6 +2068,16 @@ class FlatDualSimulator:
         self.decision_remaining_seconds = self.duration_seconds * (1.0 - self.decision_fraction)
         self.decision_tolerance_seconds = float(cfg.get("decision_tolerance_seconds", 60))
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
+        self.early_check_remaining = [
+            self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
+        ]
+        early_columns = [
+            f"early{i}_{name}"
+            for i in range(1, len(self.early_check_remaining) + 1)
+            for name in ("time_left", "gap", "binance_gap", "up_ask", "down_ask")
+        ]
+        split = FLAT_DUAL_TRADES_HEADER.index("gap_at_entry")
+        self.trades_header = FLAT_DUAL_TRADES_HEADER[:split] + early_columns + FLAT_DUAL_TRADES_HEADER[split:]
         self.trades_log_file = str(
             cfg.get("trades_log_file") or flat_dual_trades_path(self.coin, self.duration_minutes)
         )
@@ -2080,6 +2092,8 @@ class FlatDualSimulator:
         self._decided_windows: set[int] = set()
         self._gaps: dict[int, dict[str, float]] = {}
         self._first_seen: dict[int, float] = {}
+        self._early: dict[int, dict[str, Any]] = {}
+        self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
         self.status_line = "fd: idle"
@@ -2091,19 +2105,19 @@ class FlatDualSimulator:
         if os.path.isfile(path) and os.path.getsize(path) > 0:
             with open(path, newline="", encoding="utf-8") as f:
                 existing = next(csv.reader(f), None)
-            if existing == FLAT_DUAL_TRADES_HEADER:
+            if existing == self.trades_header:
                 return
             archived = f"{path}.bak"
             os.replace(path, archived)
             print(f"⚠️  Flat-dual trades log schema updated; old file moved to {archived}")
         with open(path, mode="a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(FLAT_DUAL_TRADES_HEADER)
+            csv.writer(f).writerow(self.trades_header)
 
     def _append_row(self, row: dict[str, Any]) -> None:
         self._ensure_trades_header()
         with open(self.trades_log_file, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=FLAT_DUAL_TRADES_HEADER, extrasaction="ignore")
-            writer.writerow({k: row.get(k, "") for k in FLAT_DUAL_TRADES_HEADER})
+            writer = csv.DictWriter(f, fieldnames=self.trades_header, extrasaction="ignore")
+            writer.writerow({k: row.get(k, "") for k in self.trades_header})
 
     def _print_event(self, message: str) -> None:
         sys.stdout.write("\n" + message + "\n")
@@ -2304,6 +2318,30 @@ class FlatDualSimulator:
         g["max"] = max(g["max"], gap)
         g["min"] = min(g["min"], gap)
 
+    def _record_early_checks(
+        self,
+        window_start: int,
+        price_to_beat: float,
+        current_price: float,
+        remaining: float,
+        up_ask: float,
+        down_ask: float,
+    ) -> None:
+        fields = self._early.setdefault(window_start, {})
+        for i, check_remaining in enumerate(self.early_check_remaining, start=1):
+            key = f"early{i}_time_left"
+            if key in fields or remaining > check_remaining:
+                continue
+            if remaining < check_remaining - self.decision_tolerance_seconds:
+                fields[key] = ""
+                continue
+            has_price = current_price > 0 and price_to_beat > 0
+            fields[key] = _format_mmss(remaining)
+            fields[f"early{i}_gap"] = round(current_price - price_to_beat, 2) if has_price else ""
+            fields[f"early{i}_binance_gap"] = self._binance_gap(price_to_beat)
+            fields[f"early{i}_up_ask"] = round(up_ask, 2) if up_ask > 0 else ""
+            fields[f"early{i}_down_ask"] = round(down_ask, 2) if down_ask > 0 else ""
+
     def _binance_gap(self, price_to_beat: float) -> float | str:
         if self._binance_price > 0 and price_to_beat > 0:
             return round(self._binance_price - price_to_beat, 2)
@@ -2311,8 +2349,12 @@ class FlatDualSimulator:
 
     def _gap_fields(self, window_start: int, price_to_beat: float, final_price: float) -> dict[str, Any]:
         g = self._gaps.get(window_start)
+        end_up, end_down = self._last_asks.get(window_start, (0.0, 0.0))
         final_gap = final_price - price_to_beat if final_price > 0 and price_to_beat > 0 else None
         return {
+            **self._early.get(window_start, {}),
+            "up_ask_at_end": round(end_up, 2) if end_up > 0 else "",
+            "down_ask_at_end": round(end_down, 2) if end_down > 0 else "",
             "start_gap": round(g["start"], 2) if g else "",
             "max_gap_before_entry": round(g["max"], 2) if g else "",
             "min_gap_before_entry": round(g["min"], 2) if g else "",
@@ -2333,6 +2375,11 @@ class FlatDualSimulator:
         self._binance_price = binance_price
         self._first_seen.setdefault(window_start, remaining_seconds)
         self._track_gap(window_start, price_to_beat, current_price)
+        self._record_early_checks(
+            window_start, price_to_beat, current_price, remaining_seconds, up_ask, down_ask
+        )
+        if up_ask > 0 and down_ask > 0:
+            self._last_asks[window_start] = (up_ask, down_ask)
         trade = self.open_trades.get(window_start)
         if trade is not None:
             self._update_fills(trade, remaining_seconds, up_ask, down_ask)
@@ -2353,6 +2400,8 @@ class FlatDualSimulator:
         self._decided_windows = {w for w in self._decided_windows if w >= window_start}
         self._gaps = {w: g for w, g in self._gaps.items() if w > window_start}
         self._first_seen = {w: s for w, s in self._first_seen.items() if w > window_start}
+        self._early = {w: v for w, v in self._early.items() if w > window_start}
+        self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)
             skip_row["outcome"] = outcome

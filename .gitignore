@@ -18,3 +18,4 @@ __pycache__/
 *.pyc
 scratch/
 price-socket.json
+*.bak

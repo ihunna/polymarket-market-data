@@ -157,7 +157,14 @@ class PersistentPolymarketWS:
     def update_tokens(self, token_ids):
         """Switch markets on a fresh connection so no old subscriptions linger."""
         with self.lock:
+            had_tokens = bool(self.active_tokens)
             self.active_tokens = token_ids
+            if not had_tokens:
+                # Nothing to replace: subscribe on the live connection, or let _on_open do it.
+                if self.connected and self.ws is not None:
+                    self.last_update = time.time()
+                    self._send_subscription(self.ws, token_ids)
+                return
         self._reconnect()
 
     def _mark_disconnected(self):

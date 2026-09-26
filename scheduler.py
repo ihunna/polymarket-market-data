@@ -125,20 +125,47 @@ def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, ou
         ])
 
 # --- Single Global Permanent WebSocket Manager for Order Book Asks Only ---
+ORDER_BOOK_STALE_SECONDS = 10
+
+
 class PersistentPolymarketWS:
     def __init__(self):
         self.ws = None
         self.active_tokens = []
         self.is_running = True
         self.lock = threading.Lock()
+        self.last_update = time.time()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
     def update_tokens(self, token_ids):
+        """Switch markets on a fresh connection so no old subscriptions linger."""
         with self.lock:
             self.active_tokens = token_ids
-            if self.ws and ws_state["connected"]:
-                self._send_subscription(self.ws, token_ids)
+            self.last_update = time.time()
+        self._reconnect()
+
+    def _reconnect(self):
+        ws = self.ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _watchdog_loop(self):
+        while self.is_running:
+            time.sleep(1)
+            with self.lock:
+                has_tokens = bool(self.active_tokens)
+                quiet_for = time.time() - self.last_update
+            if has_tokens and quiet_for > ORDER_BOOK_STALE_SECONDS:
+                sys.stdout.write(f"\n⚠️ Order book quiet for {quiet_for:.0f}s, reconnecting...\n")
+                sys.stdout.flush()
+                with self.lock:
+                    self.last_update = time.time()
+                self._reconnect()
 
     def _send_subscription(self, ws, token_ids):
         try:
@@ -162,6 +189,14 @@ class PersistentPolymarketWS:
                 down_t = self.active_tokens[1] if len(self.active_tokens) > 1 else None
 
             for item in items:
+                if not isinstance(item, dict):
+                    continue
+                asset_ids = {item.get("asset_id")} | {
+                    c.get("asset_id") for c in item.get("price_changes", []) if isinstance(c, dict)
+                }
+                if asset_ids & {up_t, down_t} - {None}:
+                    with self.lock:
+                        self.last_update = time.time()
                 if item.get("event_type") == "price_change":
                     for change in item.get("price_changes", []):
                         asset_id = change.get("asset_id")
@@ -178,6 +213,7 @@ class PersistentPolymarketWS:
     def _on_open(self, ws):
         ws_state["connected"] = True
         with self.lock:
+            self.last_update = time.time()
             if self.active_tokens:
                 self._send_subscription(ws, self.active_tokens)
 

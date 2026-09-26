@@ -12,6 +12,9 @@ solana-15-opposite-trades.csv
 solana-5-opposite-trades.csv
 solana-60-opposite-trades.csv
 solana-15-trades-late_80.csv
+solana-*-flat-dual-trades.csv
 solana-15-opposite-trades.csv.bak
 __pycache__/
 *.pyc
+scratch/
+price-socket.json

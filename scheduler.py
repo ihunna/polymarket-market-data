@@ -6,13 +6,12 @@ import csv
 import json
 import calendar
 import threading
+from collections import deque
 from datetime import datetime
 import zoneinfo
 import websocket
 from polymarket_poller import (
     fetch_polymarket_data,
-    fetch_polymarket_current_price,
-    fetch_polymarket_end_price,
     get_market_metadata_for_slug,
 )
 from signal_engine import StrategyRunner, load_config, apply_duration_paths
@@ -61,6 +60,11 @@ def format_time(seconds):
 
 def format_dollar(price):
     return f"${price:.2f}"
+
+def format_ticker(label, price, price_to_beat):
+    if price <= 0:
+        return f"{label}: --"
+    return f"{label}: {format_dollar(price)} ({price - price_to_beat:+.2f})"
 
 def format_token_cents(raw):
     if raw <= 0 or raw > 1.0:
@@ -200,7 +204,177 @@ class PersistentPolymarketWS:
             if self.is_running:
                 time.sleep(2)
 
-def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
+
+PRICE_WS_URL = "wss://ws-live-data.polymarket.com/"
+PRICE_WS_ORIGIN = "https://polymarket.com"
+PRICE_WS_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+)
+PRICE_STALE_SECONDS = 15
+PRICE_HISTORY_SECONDS = 3900
+PRICE_BOUNDARY_TOLERANCE_SECONDS = 10
+PRICE_END_WAIT_SECONDS = 15
+
+
+PRICE_TOPIC = "crypto_prices_twap_sixty"
+BINANCE_TOPIC = "crypto_prices"
+
+
+class PersistentPriceWS:
+    """Streams the 60s-TWAP SOL price Polymarket displays, plus Binance SOL, from its real-time data socket."""
+
+    def __init__(self, price_symbol="sol/usd", binance_symbol="solusdt"):
+        self.price_symbol = price_symbol
+        self.binance_symbol = binance_symbol
+        self.ws = None
+        self.connected = False
+        self.is_running = True
+        self.lock = threading.Lock()
+        self.prices = deque()
+        self.binance_latest = (0, 0.0)
+        threading.Thread(target=self._run_loop, daemon=True).start()
+        threading.Thread(target=self._ping_loop, daemon=True).start()
+
+    def _subscribe(self, ws):
+        # The server matches live updates against the exact filter text; it must be
+        # compact JSON (no spaces), as browsers send it, or only the snapshot arrives.
+        compact = {"separators": (",", ":")}
+        ws.send(json.dumps({
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": PRICE_TOPIC,
+                    "type": "update",
+                    "filters": json.dumps({"symbol": self.price_symbol}, **compact),
+                },
+                {
+                    "topic": BINANCE_TOPIC,
+                    "type": "update",
+                    "filters": json.dumps({"symbol": self.binance_symbol}, **compact),
+                },
+            ],
+        }, **compact))
+
+    def _on_open(self, ws):
+        self.connected = True
+        try:
+            self._subscribe(ws)
+        except Exception:
+            pass
+
+    def _on_message(self, ws, message):
+        if not message or message == "PONG":
+            return
+        try:
+            data = json.loads(message)
+        except ValueError:
+            return
+        for item in data if isinstance(data, list) else [data]:
+            if not isinstance(item, dict):
+                continue
+            topic = item.get("topic")
+            payload = item.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            symbol = str(payload.get("symbol") or "").lower()
+            points = payload.get("data") if isinstance(payload.get("data"), list) else [payload]
+            if topic == PRICE_TOPIC and not symbol:
+                symbol = self.price_symbol
+            elif topic == BINANCE_TOPIC and not symbol:
+                symbol = self.binance_symbol
+            for point in points:
+                try:
+                    ts = int(point.get("timestamp") or 0)
+                    value = float(point.get("value") or 0)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if ts <= 0 or value <= 0:
+                    continue
+                if topic == PRICE_TOPIC and symbol == self.price_symbol:
+                    self._add_price(ts, value)
+                elif topic == BINANCE_TOPIC and symbol == self.binance_symbol:
+                    with self.lock:
+                        if ts >= self.binance_latest[0]:
+                            self.binance_latest = (ts, value)
+
+    def _add_price(self, ts, value):
+        with self.lock:
+            if self.prices and ts <= self.prices[-1][0]:
+                return
+            self.prices.append((ts, value))
+            cutoff = ts - PRICE_HISTORY_SECONDS * 1000
+            while self.prices and self.prices[0][0] < cutoff:
+                self.prices.popleft()
+
+    def latest_price(self):
+        with self.lock:
+            if not self.prices:
+                return 0.0
+            ts, value = self.prices[-1]
+        return value if time.time() * 1000 - ts <= PRICE_STALE_SECONDS * 1000 else 0.0
+
+    def latest_binance(self):
+        with self.lock:
+            ts, value = self.binance_latest
+        return value if value > 0 and time.time() * 1000 - ts <= PRICE_STALE_SECONDS * 1000 else 0.0
+
+    def price_at(self, epoch_seconds):
+        """Last streamed price at or before ``epoch_seconds``; 0.0 if none close enough."""
+        target = epoch_seconds * 1000
+        with self.lock:
+            for ts, value in reversed(self.prices):
+                if ts <= target:
+                    return value if target - ts <= PRICE_BOUNDARY_TOLERANCE_SECONDS * 1000 else 0.0
+        return 0.0
+
+    def wait_for_price_at(self, epoch_seconds, timeout=PRICE_END_WAIT_SECONDS):
+        """Wait until a tick at or after ``epoch_seconds`` has arrived, then return ``price_at``."""
+        deadline = time.time() + timeout
+        target = epoch_seconds * 1000
+        while time.time() < deadline:
+            with self.lock:
+                arrived = bool(self.prices) and self.prices[-1][0] >= target
+            if arrived:
+                break
+            time.sleep(0.25)
+        return self.price_at(epoch_seconds)
+
+    def _on_close(self, ws, code, msg):
+        self.connected = False
+
+    def _on_error(self, ws, error):
+        self.connected = False
+
+    def _ping_loop(self):
+        while self.is_running:
+            time.sleep(5)
+            if self.connected and self.ws is not None:
+                try:
+                    self.ws.send("PING")
+                except Exception:
+                    pass
+
+    def _run_loop(self):
+        while self.is_running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    PRICE_WS_URL,
+                    header=[f"User-Agent: {PRICE_WS_USER_AGENT}"],
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_close=self._on_close,
+                    on_error=self._on_error,
+                )
+                self.ws.run_forever(origin=PRICE_WS_ORIGIN)
+            except Exception:
+                pass
+            self.connected = False
+            if self.is_running:
+                time.sleep(2)
+
+
+def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None):
     """Executes a window loop tracking token asks and syncing window boundary to ET/UTC epoch."""
     now_utc = calendar.timegm(time.gmtime())
     
@@ -235,12 +409,6 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
     initialized = False
-    current_price = 0.0
-    last_price_fetch_at = 0.0
-
-    decision_horizon = 0.0
-    if simulator is not None:
-        decision_horizon = float(getattr(simulator, "decision_remaining_seconds", 0) or 0)
 
     print(f"📊 Price to Beat (Baseline): {format_dollar(price_to_beat)}")
 
@@ -251,10 +419,11 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
             remaining = 0
         
         if current_time >= window_end:
-            print("\n⏳ Window ended. Fetching end price from Polymarket...")
-            final_price = fetch_polymarket_end_price(window_start, duration_minutes=DURATION_MINUTES)
+            print("\n⏳ Window ended. Reading end price from the price socket...")
+            price_to_beat = price_ws.price_at(window_start) or price_to_beat
+            final_price = price_ws.wait_for_price_at(window_end)
             if final_price == 0.0:
-                print("⚠️ Polymarket fetch failed, falling back to previous price-to-beat.")
+                print("⚠️ No socket price at window end, falling back to previous price-to-beat.")
                 final_price = price_to_beat
             
             up_final = ws_state["up_raw"]
@@ -306,17 +475,14 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
             if 0.0 < down_cost <= 1.0 and down_cost < lowest_down_seen:
                 lowest_down_seen = down_cost
 
-        need_price = decision_horizon > 0 and remaining <= decision_horizon
-        if need_price and (current_time - last_price_fetch_at) >= 2.0:
-            fetched = fetch_polymarket_current_price(window_start, duration_minutes=DURATION_MINUTES)
-            last_price_fetch_at = current_time
-            if fetched > 0:
-                current_price = fetched
+        current_price = price_ws.latest_price()
+        binance_price = price_ws.latest_binance()
+        gap_ptb = price_ws.price_at(window_start) or price_to_beat
 
         if simulator is not None:
             simulator.on_window_update(
                 window_start=window_start,
-                price_to_beat=price_to_beat,
+                price_to_beat=gap_ptb,
                 current_price=current_price,
                 lowest_up=lowest_up_seen,
                 lowest_down=lowest_down_seen,
@@ -324,6 +490,7 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
                 up_ask=up_cost,
                 down_ask=down_cost,
                 inferred_outcome=None,
+                binance_price=binance_price,
             )
 
         up_cents = format_token_cents(up_cost)
@@ -333,7 +500,8 @@ def run_high_frequency_loop(ws_manager, price_to_beat, simulator=None):
         if simulator is not None:
             sim_bit = f" | {simulator.display_status(window_start)}"
         display_str = (
-            f"PTB: {format_dollar(price_to_beat)} | Up: {up_cents} | Down: {down_cents}{sim_bit}"
+            f"PTB: {format_dollar(gap_ptb)} | {format_ticker('PM', current_price, gap_ptb)} | "
+            f"{format_ticker('Binance', binance_price, gap_ptb)} | Up: {up_cents} | Down: {down_cents}{sim_bit}"
         )
         update_window_progress(window_start, window_end, formatted_message=display_str)
         
@@ -343,6 +511,7 @@ def start_aligned_runner(simulator=None):
     """Initializes services and prompts for initial manual PTB."""
     print(f"🔌 Initializing services... (window={DURATION_MINUTES}m)")
     global_ws_manager = PersistentPolymarketWS()
+    price_ws = PersistentPriceWS()
     
     while True:
         try:
@@ -358,6 +527,7 @@ def start_aligned_runner(simulator=None):
                 global_ws_manager,
                 price_to_beat=current_ptb,
                 simulator=simulator,
+                price_ws=price_ws,
             )
         except Exception as e:
             print(f"\nError in loop execution: {e}. Restarting cycle...")

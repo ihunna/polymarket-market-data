@@ -73,6 +73,42 @@ OPPOSITE_TRADES_HEADER = [
     "regime_mode",
 ]
 
+FLAT_DUAL_TRADES_HEADER = [
+    "signal_timestamp",
+    "window_start",
+    "slug",
+    "remaining_at_entry",
+    "price_to_beat",
+    "price_at_entry",
+    "start_gap",
+    "max_gap_before_entry",
+    "min_gap_before_entry",
+    "gap_at_entry",
+    "final_gap",
+    "binance_gap_at_entry",
+    "max_move",
+    "limit_cents",
+    "up_ask_at_entry",
+    "down_ask_at_entry",
+    "entry_mode",
+    "capital_before",
+    "free_capital_before",
+    "locked_capital_before",
+    "invested_amount",
+    "contracts",
+    "up_filled",
+    "down_filled",
+    "fill_type",
+    "entry_up",
+    "entry_down",
+    "outcome",
+    "pnl",
+    "capital_after",
+    "free_capital_after",
+    "mode",
+    "notes",
+]
+
 HISTORY_LIMIT = 20
 REGIME_HISTORY_LIMIT = 400
 VALID_BIAS_MODES = ("off", "ref", "rolling", "ema")
@@ -111,6 +147,16 @@ OPPOSITE_REQUIRED = [
     "decision_remaining_seconds",
 ]
 
+FLAT_DUAL_REQUIRED = [
+    "enabled",
+    "capital",
+    "investable_per_trade",
+    "capital_mode",
+    "limit_cents",
+    "max_move",
+    "decision_fraction",
+]
+
 
 def data_file_paths(coin: str, duration_minutes: int) -> tuple[str, str]:
     """Return (market_data_file, dual_hedge_trades_file) from coin + duration."""
@@ -120,6 +166,10 @@ def data_file_paths(coin: str, duration_minutes: int) -> tuple[str, str]:
 
 def opposite_trades_path(coin: str, duration_minutes: int) -> str:
     return f"{coin}-{int(duration_minutes)}-opposite-trades.csv"
+
+
+def flat_dual_trades_path(coin: str, duration_minutes: int) -> str:
+    return f"{coin}-{int(duration_minutes)}-flat-dual-trades.csv"
 
 
 def apply_duration_paths(config: dict[str, Any], coin: str, duration_minutes: int) -> dict[str, Any]:
@@ -139,6 +189,10 @@ def apply_duration_paths(config: dict[str, Any], coin: str, duration_minutes: in
         opp = dict(strategies["opposite_side"])
         opp["trades_log_file"] = opposite_trades_path(coin, duration_minutes)
         strategies["opposite_side"] = opp
+    if "flat_dual" in strategies and isinstance(strategies["flat_dual"], dict):
+        fd = dict(strategies["flat_dual"])
+        fd["trades_log_file"] = flat_dual_trades_path(coin, duration_minutes)
+        strategies["flat_dual"] = fd
     config["strategies"] = strategies
     # Back-compat alias used by older dual-hedge wiring
     config["trades_log_file"] = dh_trades
@@ -185,6 +239,18 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
         if opp["capital_mode"] not in ("locked", "unlocked"):
             raise ValueError("strategies.opposite_side.capital_mode must be 'locked' or 'unlocked'")
 
+    if "flat_dual" in strategies:
+        fd = strategies["flat_dual"]
+        if not isinstance(fd, dict):
+            raise ValueError("strategies.flat_dual must be a mapping")
+        miss = [k for k in FLAT_DUAL_REQUIRED if k not in fd]
+        if miss:
+            raise ValueError(f"strategies.flat_dual missing keys: {miss}")
+        if fd["capital_mode"] not in ("locked", "unlocked"):
+            raise ValueError("strategies.flat_dual.capital_mode must be 'locked' or 'unlocked'")
+        if not 0.0 < float(fd["decision_fraction"]) < 1.0:
+            raise ValueError("strategies.flat_dual.decision_fraction must be between 0 and 1")
+
     market_bias = data.get("market_bias")
     if market_bias is None:
         data["market_bias"] = {"mode": "off"}
@@ -210,6 +276,11 @@ def _parse_price(value: Any) -> float:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def _format_mmss(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    return f"{total // 60:02d}:{total % 60:02d}"
 
 
 def _coin_slug_prefix(coin: str) -> str:
@@ -388,7 +459,7 @@ def _regime_row_fields(
     state = regime.get_state(current_price)
     return {
         "bias": state.bias,
-        "move_amount": round(state.move_amount, 6),
+        "move_amount": round(state.move_amount, 2),
         "regime_mode": state.mode,
     }
 
@@ -920,12 +991,12 @@ class DualHedgeSimulator:
                 "slug": slug,
                 "setup_window_start": setup_window_start,
                 "setup_streak": streak_len,
-                "setup_abs_delta": round(abs_delta, 6),
-                "setup_total_move": round(total_move, 6),
+                "setup_abs_delta": round(abs_delta, 2),
+                "setup_total_move": round(total_move, 2),
                 "limit_cents": self.limit_cents,
-                "capital_before": round(equity_before, 6),
-                "free_capital_before": round(free_before, 6),
-                "locked_capital_before": round(locked_before, 6),
+                "capital_before": round(equity_before, 2),
+                "free_capital_before": round(free_before, 2),
+                "locked_capital_before": round(locked_before, 2),
                 "invested_amount": 0,
                 "contracts": 0,
                 "up_filled": "",
@@ -936,8 +1007,8 @@ class DualHedgeSimulator:
                 "exit_up": "",
                 "exit_down": "",
                 "pnl": "",
-                "capital_after": round(equity_before, 6),
-                "free_capital_after": round(free_before, 6),
+                "capital_after": round(equity_before, 2),
+                "free_capital_after": round(free_before, 2),
                 "mode": self.mode,
                 "notes": reason,
                 "setup_direction": setup_direction or "",
@@ -1071,13 +1142,13 @@ class DualHedgeSimulator:
             slug=slug,
             setup_window_start=setup_window_start,
             setup_streak=streak_len,
-            setup_abs_delta=round(abs_delta, 6),
-            setup_total_move=round(total_move, 6),
+            setup_abs_delta=round(abs_delta, 2),
+            setup_total_move=round(total_move, 2),
             limit_cents=self.limit_cents,
-            capital_before=round(equity_before, 6),
-            free_capital_before=round(free_before, 6),
-            locked_capital_before=round(locked_before, 6),
-            invested_amount=round(required_cost, 6),
+            capital_before=round(equity_before, 2),
+            free_capital_before=round(free_before, 2),
+            locked_capital_before=round(locked_before, 2),
+            invested_amount=round(required_cost, 2),
             contracts=contracts,
             notes=note,
             setup_direction=setup_direction,
@@ -1211,9 +1282,9 @@ class DualHedgeSimulator:
                 "entry_down": trade.entry_down if down_filled else "",
                 "exit_up": exit_up if exit_up is not None else "",
                 "exit_down": exit_down if exit_down is not None else "",
-                "pnl": round(pnl, 6),
-                "capital_after": round(equity_after, 6),
-                "free_capital_after": round(free_after, 6),
+                "pnl": round(pnl, 2),
+                "capital_after": round(equity_after, 2),
+                "free_capital_after": round(free_after, 2),
                 "mode": self.mode,
                 "notes": note,
                 "setup_direction": trade.setup_direction,
@@ -1223,7 +1294,7 @@ class DualHedgeSimulator:
         self.status_line = f"dh settled pnl={pnl:+.2f}"
         self._print_event(
             f"📒 [dual_hedge] TRADE SETTLED {trade.slug} | fill={fill_type} | outcome={outcome} "
-            f"| pnl={pnl:+.4f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
+            f"| pnl={pnl:+.2f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
         )
         del self.open_trades[window_start]
 
@@ -1269,6 +1340,7 @@ class DualHedgeSimulator:
         up_ask: float,
         down_ask: float,
         inferred_outcome: str | None,
+        **_: Any,
     ) -> dict[str, Any] | None:
         if self._active_window_start != window_start:
             self._active_window_start = window_start
@@ -1552,13 +1624,13 @@ class OppositeSideSimulator:
                 "setup_window_start": setup_window_start,
                 "setup_streak": streak_len,
                 "setup_direction": setup_direction or "",
-                "setup_abs_delta": round(abs_delta, 6),
-                "setup_total_move": round(total_move, 6),
+                "setup_abs_delta": round(abs_delta, 2),
+                "setup_total_move": round(total_move, 2),
                 "limit_cents": self.limit_cents,
                 "side": side,
-                "capital_before": round(equity_before, 6),
-                "free_capital_before": round(free_before, 6),
-                "locked_capital_before": round(locked_before, 6),
+                "capital_before": round(equity_before, 2),
+                "free_capital_before": round(free_before, 2),
+                "locked_capital_before": round(locked_before, 2),
                 "invested_amount": 0,
                 "contracts": 0,
                 "filled": False,
@@ -1566,8 +1638,8 @@ class OppositeSideSimulator:
                 "exit": "",
                 "fill_type": "skipped",
                 "pnl": "",
-                "capital_after": round(equity_before, 6),
-                "free_capital_after": round(free_before, 6),
+                "capital_after": round(equity_before, 2),
+                "free_capital_after": round(free_before, 2),
                 "mode": self.mode,
                 "notes": reason,
             },
@@ -1715,14 +1787,14 @@ class OppositeSideSimulator:
             setup_window_start=setup_window_start,
             setup_streak=streak_len,
             setup_direction=str(setup_direction),
-            setup_abs_delta=round(abs_delta, 6),
-            setup_total_move=round(total_move, 6),
+            setup_abs_delta=round(abs_delta, 2),
+            setup_total_move=round(total_move, 2),
             limit_cents=self.limit_cents,
             side=side,
-            capital_before=round(equity_before, 6),
-            free_capital_before=round(free_before, 6),
-            locked_capital_before=round(locked_before, 6),
-            invested_amount=round(required_cost, 6),
+            capital_before=round(equity_before, 2),
+            free_capital_before=round(free_before, 2),
+            locked_capital_before=round(locked_before, 2),
+            invested_amount=round(required_cost, 2),
             contracts=contracts,
             notes=note,
         )
@@ -1834,9 +1906,9 @@ class OppositeSideSimulator:
                 "entry": trade.entry if trade.filled else "",
                 "exit": exit_val,
                 "fill_type": fill_type,
-                "pnl": round(pnl, 6),
-                "capital_after": round(equity_after, 6),
-                "free_capital_after": round(free_after, 6),
+                "pnl": round(pnl, 2),
+                "capital_after": round(equity_after, 2),
+                "free_capital_after": round(free_after, 2),
                 "mode": self.mode,
                 "notes": note,
             },
@@ -1845,7 +1917,7 @@ class OppositeSideSimulator:
         self.status_line = f"opp settled pnl={pnl:+.2f}"
         self._print_event(
             f"📒 [opposite_side] TRADE SETTLED {trade.slug} | side={trade.side} | fill={fill_type} "
-            f"| outcome={outcome} | pnl={pnl:+.4f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
+            f"| outcome={outcome} | pnl={pnl:+.2f} | equity=${equity_after:.2f} | free=${free_after:.2f}"
         )
         del self.open_trades[window_start]
 
@@ -1891,6 +1963,7 @@ class OppositeSideSimulator:
         up_ask: float,
         down_ask: float,
         inferred_outcome: str | None,
+        **_: Any,
     ) -> dict[str, Any] | None:
         if self._active_window_start != window_start:
             self._active_window_start = window_start
@@ -1944,6 +2017,399 @@ class OppositeSideSimulator:
         return signal
 
 
+@dataclass
+class FlatDualOpenTrade:
+    signal_timestamp: int
+    window_start: int
+    slug: str
+    remaining_at_entry: str
+    price_to_beat: float
+    price_at_entry: float
+    gap_at_entry: float
+    up_ask_at_entry: float
+    down_ask_at_entry: float
+    entry_mode: str
+    capital_before: float
+    free_capital_before: float
+    locked_capital_before: float
+    invested_amount: float
+    contracts: int
+    binance_gap: float | str = ""
+    up_filled: bool = False
+    down_filled: bool = False
+    entry_up: float | None = None
+    entry_down: float | None = None
+    up_resting: bool = False
+    down_resting: bool = False
+    notes: str = ""
+
+
+class FlatDualSimulator:
+    """Mid-window dual: if price is still near price-to-beat at the decision point, hold both sides.
+
+    A side already asking below the limit is bought at its ask; any side not yet bought
+    rests a limit at ``limit_cents`` and fills only on asks observed after entry.
+    """
+
+    def __init__(self, global_config: dict[str, Any], strategy_config: dict[str, Any]):
+        self.duration_minutes = int(global_config["duration_minutes"])
+        self.duration_seconds = self.duration_minutes * 60
+        self.coin = str(global_config["coin"])
+        self.mode = str(global_config["mode"])
+
+        cfg = strategy_config
+        self.limit_cents = int(cfg["limit_cents"])
+        self.limit_price = self.limit_cents / 100.0
+        self.max_move = float(cfg["max_move"])
+        self.max_binance_move = float(cfg.get("max_binance_move", self.max_move))
+        self.decision_fraction = float(cfg["decision_fraction"])
+        self.decision_remaining_seconds = self.duration_seconds * (1.0 - self.decision_fraction)
+        self.decision_tolerance_seconds = float(cfg.get("decision_tolerance_seconds", 60))
+        self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
+        self.trades_log_file = str(
+            cfg.get("trades_log_file") or flat_dual_trades_path(self.coin, self.duration_minutes)
+        )
+
+        self.capital = CapitalManager(
+            total_capital=float(cfg["capital"]),
+            investable_per_trade=float(cfg["investable_per_trade"]),
+            capital_mode=str(cfg["capital_mode"]),
+        )
+
+        self.open_trades: dict[int, FlatDualOpenTrade] = {}
+        self._decided_windows: set[int] = set()
+        self._gaps: dict[int, dict[str, float]] = {}
+        self._pending_skips: dict[int, dict[str, Any]] = {}
+        self._binance_price = 0.0
+        self.status_line = "fd: idle"
+
+        self._ensure_trades_header()
+
+    def _ensure_trades_header(self) -> None:
+        path = self.trades_log_file
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            with open(path, newline="", encoding="utf-8") as f:
+                existing = next(csv.reader(f), None)
+            if existing == FLAT_DUAL_TRADES_HEADER:
+                return
+            archived = f"{path}.bak"
+            os.replace(path, archived)
+            print(f"⚠️  Flat-dual trades log schema updated; old file moved to {archived}")
+        with open(path, mode="a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(FLAT_DUAL_TRADES_HEADER)
+
+    def _append_row(self, row: dict[str, Any]) -> None:
+        self._ensure_trades_header()
+        with open(self.trades_log_file, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=FLAT_DUAL_TRADES_HEADER, extrasaction="ignore")
+            writer.writerow({k: row.get(k, "") for k in FLAT_DUAL_TRADES_HEADER})
+
+    def _print_event(self, message: str) -> None:
+        sys.stdout.write("\n" + message + "\n")
+        sys.stdout.flush()
+
+    def _slug(self, window_start: int) -> str:
+        return f"{_coin_slug_prefix(self.coin)}-updown-{self.duration_minutes}m-{window_start}"
+
+    def display_status(self, window_start: int | None = None) -> str:
+        if window_start is not None and window_start in self.open_trades:
+            trade = self.open_trades[window_start]
+            legs = []
+            for side, filled, resting in (
+                ("Up", trade.up_filled, trade.up_resting),
+                ("Down", trade.down_filled, trade.down_resting),
+            ):
+                if filled:
+                    legs.append(f"{side}✓")
+                elif resting:
+                    legs.append(f"{side}@{self.limit_cents}¢")
+            return f"FD {trade.contracts}c [{' '.join(legs)}]"
+        return self.status_line
+
+    def _log_skip(
+        self,
+        window_start: int,
+        remaining: float,
+        price_to_beat: float,
+        current_price: float,
+        up_ask: float,
+        down_ask: float,
+        reason: str,
+    ) -> None:
+        gap = current_price - price_to_beat if current_price > 0 and price_to_beat > 0 else ""
+        self._pending_skips[window_start] = (
+            {
+                "signal_timestamp": int(time.time()),
+                "window_start": window_start,
+                "slug": self._slug(window_start),
+                "remaining_at_entry": _format_mmss(remaining),
+                "price_to_beat": round(price_to_beat, 2),
+                "price_at_entry": round(current_price, 2) if current_price else "",
+                "gap_at_entry": round(gap, 2) if gap != "" else "",
+                "binance_gap_at_entry": self._binance_gap(price_to_beat),
+                "max_move": self.max_move,
+                "limit_cents": self.limit_cents,
+                "up_ask_at_entry": up_ask,
+                "down_ask_at_entry": down_ask,
+                "capital_before": round(self.capital.equity, 2),
+                "free_capital_before": round(self.capital.free_capital, 2),
+                "locked_capital_before": round(self.capital.locked_capital, 2),
+                "invested_amount": 0,
+                "contracts": 0,
+                "fill_type": "skipped",
+                "capital_after": round(self.capital.equity, 2),
+                "free_capital_after": round(self.capital.free_capital, 2),
+                "mode": self.mode,
+                "notes": reason,
+            }
+        )
+        self.status_line = f"fd skip {reason}"
+        self._print_event(f"➖ [flat_dual] no entry | {reason} | {self._slug(window_start)}")
+
+    def _try_enter(
+        self,
+        window_start: int,
+        price_to_beat: float,
+        current_price: float,
+        remaining: float,
+        up_ask: float,
+        down_ask: float,
+    ) -> None:
+        if window_start in self._decided_windows or remaining > self.decision_remaining_seconds:
+            return
+
+        asks_ok = 0.0 < up_ask < 1.0 and 0.0 < down_ask < 1.0
+        price_ok = current_price > 0 and price_to_beat > 0
+        if not (asks_ok and price_ok):
+            if remaining < self.decision_remaining_seconds - self.decision_tolerance_seconds:
+                self._decided_windows.add(window_start)
+                reason = "no_price" if not price_ok else "no_asks"
+                self._log_skip(
+                    window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason
+                )
+            return
+
+        self._decided_windows.add(window_start)
+        gap = round(current_price - price_to_beat, 2)
+        binance_gap = round(self._binance_price - price_to_beat, 2) if self._binance_price > 0 else None
+        binance_moved = binance_gap is not None and abs(binance_gap) > self.max_binance_move
+        if abs(gap) > self.max_move or binance_moved:
+            binance_bit = f" binance={binance_gap:+.2f}" if binance_gap is not None else " pm_only"
+            self._log_skip(
+                window_start,
+                remaining,
+                price_to_beat,
+                current_price,
+                up_ask,
+                down_ask,
+                f"moved gap={gap:+.2f}{binance_bit}",
+            )
+            return
+
+        free_before = self.capital.free_capital
+        locked_before = self.capital.locked_capital
+        equity_before = self.capital.equity
+        contracts = self.capital.calculate_contracts(self.limit_cents)
+        required_cost = self.capital.required_cost(contracts, self.limit_cents)
+        if contracts <= 0:
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask,
+                "insufficient_capital",
+            )
+            return
+        ok, lock_reason = self.capital.try_lock(window_start, required_cost)
+        if not ok:
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask, lock_reason
+            )
+            return
+
+        trade = FlatDualOpenTrade(
+            signal_timestamp=int(time.time()),
+            window_start=window_start,
+            slug=self._slug(window_start),
+            remaining_at_entry=_format_mmss(remaining),
+            price_to_beat=price_to_beat,
+            price_at_entry=current_price,
+            gap_at_entry=round(gap, 2),
+            up_ask_at_entry=up_ask,
+            down_ask_at_entry=down_ask,
+            entry_mode="",
+            capital_before=round(equity_before, 2),
+            free_capital_before=round(free_before, 2),
+            locked_capital_before=round(locked_before, 2),
+            invested_amount=round(required_cost, 2),
+            contracts=contracts,
+            binance_gap=self._binance_gap(price_to_beat),
+            notes="" if binance_gap is not None else "pm_only",
+        )
+
+        cheap = [(ask, side) for ask, side in ((up_ask, "Up"), (down_ask, "Down")) if ask < self.limit_price]
+        if cheap:
+            _, cheap_side = min(cheap)
+            trade.entry_mode = f"cheap_{cheap_side.lower()}"
+        else:
+            trade.entry_mode = "both_limits"
+        for side, ask in (("Up", up_ask), ("Down", down_ask)):
+            if ask < self.limit_price:
+                self._fill(trade, side, ask)
+            else:
+                self._rest(trade, side)
+
+        self.open_trades[window_start] = trade
+        self.status_line = f"fd open {trade.entry_mode}"
+        binance_bit = f"binance={binance_gap:+.2f}" if binance_gap is not None else "pm_only"
+        self._print_event(
+            f"✅ [flat_dual] entered {trade.entry_mode} | gap={gap:+.2f} {binance_bit} | up={up_ask*100:.0f}¢ "
+            f"down={down_ask*100:.0f}¢ | {contracts}c limit {self.limit_cents}¢ | {trade.slug}"
+        )
+
+    def _fill(self, trade: FlatDualOpenTrade, side: str, price: float) -> None:
+        if side == "Up":
+            trade.up_filled, trade.up_resting, trade.entry_up = True, False, price
+        else:
+            trade.down_filled, trade.down_resting, trade.entry_down = True, False, price
+
+    def _rest(self, trade: FlatDualOpenTrade, side: str) -> None:
+        if side == "Up":
+            trade.up_resting = True
+        else:
+            trade.down_resting = True
+
+    def _update_fills(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
+        if self.cancel_remaining_seconds > 0 and remaining <= self.cancel_remaining_seconds:
+            if trade.up_resting or trade.down_resting:
+                trade.up_resting = trade.down_resting = False
+                trade.notes = ";".join(n for n in (trade.notes, "resting_cancelled") if n)
+            return
+        if trade.up_resting and 0.0 < up_ask <= self.limit_price:
+            self._fill(trade, "Up", self.limit_price)
+        if trade.down_resting and 0.0 < down_ask <= self.limit_price:
+            self._fill(trade, "Down", self.limit_price)
+
+    def _track_gap(self, window_start: int, price_to_beat: float, current_price: float) -> None:
+        if window_start in self._decided_windows or current_price <= 0 or price_to_beat <= 0:
+            return
+        gap = current_price - price_to_beat
+        g = self._gaps.setdefault(window_start, {"start": gap, "max": gap, "min": gap})
+        g["max"] = max(g["max"], gap)
+        g["min"] = min(g["min"], gap)
+
+    def _binance_gap(self, price_to_beat: float) -> float | str:
+        if self._binance_price > 0 and price_to_beat > 0:
+            return round(self._binance_price - price_to_beat, 2)
+        return ""
+
+    def _gap_fields(self, window_start: int, price_to_beat: float, final_price: float) -> dict[str, Any]:
+        g = self._gaps.get(window_start)
+        final_gap = final_price - price_to_beat if final_price > 0 and price_to_beat > 0 else None
+        return {
+            "start_gap": round(g["start"], 2) if g else "",
+            "max_gap_before_entry": round(g["max"], 2) if g else "",
+            "min_gap_before_entry": round(g["min"], 2) if g else "",
+            "final_gap": round(final_gap, 2) if final_gap is not None else "",
+        }
+
+    def on_window_update(
+        self,
+        window_start: int,
+        price_to_beat: float,
+        current_price: float,
+        remaining_seconds: float,
+        up_ask: float,
+        down_ask: float,
+        binance_price: float = 0.0,
+        **_: Any,
+    ) -> None:
+        self._binance_price = binance_price
+        self._track_gap(window_start, price_to_beat, current_price)
+        trade = self.open_trades.get(window_start)
+        if trade is not None:
+            self._update_fills(trade, remaining_seconds, up_ask, down_ask)
+            return
+        self._try_enter(window_start, price_to_beat, current_price, remaining_seconds, up_ask, down_ask)
+
+    def on_window_close(
+        self,
+        window_start: int,
+        outcome: str,
+        price_to_beat: float = 0.0,
+        final_price: float = 0.0,
+        **_: Any,
+    ) -> None:
+        trade = self.open_trades.pop(window_start, None)
+        skip_row = self._pending_skips.pop(window_start, None)
+        gap_fields = self._gap_fields(window_start, price_to_beat, final_price)
+        self._decided_windows = {w for w in self._decided_windows if w >= window_start}
+        self._gaps = {w: g for w, g in self._gaps.items() if w > window_start}
+        if skip_row is not None:
+            skip_row.update(gap_fields)
+            skip_row["outcome"] = outcome
+            self._append_row(skip_row)
+        if trade is None:
+            return
+
+        if trade.up_filled and trade.down_filled:
+            fill_type = "both"
+        elif trade.up_filled:
+            fill_type = "only_up"
+        elif trade.down_filled:
+            fill_type = "only_down"
+        else:
+            fill_type = "none"
+
+        pnl = 0.0
+        notes = [n for n in (trade.notes,) if n]
+        if outcome in ("Up", "Down"):
+            if trade.up_filled:
+                pnl += trade.contracts * ((1.0 if outcome == "Up" else 0.0) - trade.entry_up)
+            if trade.down_filled:
+                pnl += trade.contracts * ((1.0 if outcome == "Down" else 0.0) - trade.entry_down)
+        else:
+            notes.append("outcome_unknown")
+
+        _, free_after, equity_after = self.capital.release(window_start, pnl)
+        self._append_row(
+            {
+                **gap_fields,
+                "signal_timestamp": trade.signal_timestamp,
+                "window_start": trade.window_start,
+                "slug": trade.slug,
+                "remaining_at_entry": trade.remaining_at_entry,
+                "price_to_beat": round(trade.price_to_beat, 2),
+                "price_at_entry": round(trade.price_at_entry, 2),
+                "gap_at_entry": trade.gap_at_entry,
+                "binance_gap_at_entry": trade.binance_gap,
+                "max_move": self.max_move,
+                "limit_cents": self.limit_cents,
+                "up_ask_at_entry": trade.up_ask_at_entry,
+                "down_ask_at_entry": trade.down_ask_at_entry,
+                "entry_mode": trade.entry_mode,
+                "capital_before": trade.capital_before,
+                "free_capital_before": trade.free_capital_before,
+                "locked_capital_before": trade.locked_capital_before,
+                "invested_amount": trade.invested_amount,
+                "contracts": trade.contracts,
+                "up_filled": trade.up_filled,
+                "down_filled": trade.down_filled,
+                "fill_type": fill_type,
+                "entry_up": trade.entry_up if trade.up_filled else "",
+                "entry_down": trade.entry_down if trade.down_filled else "",
+                "outcome": outcome,
+                "pnl": round(pnl, 2),
+                "capital_after": round(equity_after, 2),
+                "free_capital_after": round(free_after, 2),
+                "mode": self.mode,
+                "notes": ";".join(notes) or "settled",
+            }
+        )
+        self.status_line = f"fd settled pnl={pnl:+.2f}"
+        self._print_event(
+            f"📒 [flat_dual] SETTLED {trade.slug} | {trade.entry_mode} fill={fill_type} "
+            f"| outcome={outcome} | pnl={pnl:+.2f} | equity=${equity_after:.2f}"
+        )
+
+
 class StrategyRunner:
     """Fan-out window events to enabled independent strategies."""
 
@@ -1987,6 +2453,12 @@ class StrategyRunner:
             enabled.append(OppositeSideSimulator(config, opp_cfg, history=history, regime=regime))
             max_decision = max(max_decision, float(opp_cfg.get("decision_remaining_seconds", 0)))
 
+        fd_cfg = strategies_cfg.get("flat_dual")
+        if isinstance(fd_cfg, dict) and fd_cfg.get("enabled"):
+            flat_dual = FlatDualSimulator(config, fd_cfg)
+            enabled.append(flat_dual)
+            max_decision = max(max_decision, flat_dual.decision_remaining_seconds)
+
         return cls(
             enabled,
             decision_remaining_seconds=max_decision,
@@ -2024,6 +2496,12 @@ class StrategyRunner:
                 lines.append(
                     f"  opposite_side: capital=${s.capital.equity:.2f} limit={s.limit_cents}¢ "
                     f"trades={s.trades_log_file} history={len(s.history)}"
+                )
+            elif isinstance(s, FlatDualSimulator):
+                lines.append(
+                    f"  flat_dual: capital=${s.capital.equity:.2f} limit={s.limit_cents}¢ "
+                    f"max_move=${s.max_move:.2f} binance_max=${s.max_binance_move:.2f} decide_at={s.decision_remaining_seconds:.0f}s left "
+                    f"trades={s.trades_log_file}"
                 )
             else:
                 lines.append(f"  {type(s).__name__}")

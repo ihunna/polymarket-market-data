@@ -5,6 +5,7 @@ import time
 import csv
 import json
 import calendar
+import socket
 import threading
 from collections import deque
 from datetime import datetime
@@ -15,6 +16,16 @@ from polymarket_poller import (
     get_market_metadata_for_slug,
 )
 from signal_engine import StrategyRunner, load_config, apply_duration_paths
+
+# Some cloud hosts stall on IPv6 connects; resolve IPv4 only for this process.
+_system_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _system_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_only_getaddrinfo
 
 COIN_NAME = "solana"
 SUPPORTED_DURATIONS = (5, 15, 60)
@@ -126,6 +137,7 @@ def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, ou
 
 # --- Single Global Permanent WebSocket Manager for Order Book Asks Only ---
 ORDER_BOOK_STALE_SECONDS = 10
+ORDER_BOOK_CONNECT_TIMEOUT_SECONDS = 60
 
 
 class PersistentPolymarketWS:
@@ -135,6 +147,9 @@ class PersistentPolymarketWS:
         self.is_running = True
         self.lock = threading.Lock()
         self.last_update = time.time()
+        self.connected = False
+        self.ever_connected = False
+        self.disconnected_at = time.time()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         threading.Thread(target=self._watchdog_loop, daemon=True).start()
@@ -143,10 +158,16 @@ class PersistentPolymarketWS:
         """Switch markets on a fresh connection so no old subscriptions linger."""
         with self.lock:
             self.active_tokens = token_ids
-            self.last_update = time.time()
         self._reconnect()
 
+    def _mark_disconnected(self):
+        with self.lock:
+            if self.connected or self.disconnected_at is None:
+                self.disconnected_at = time.time()
+            self.connected = False
+
     def _reconnect(self):
+        self._mark_disconnected()
         ws = self.ws
         if ws is not None:
             try:
@@ -157,15 +178,29 @@ class PersistentPolymarketWS:
     def _watchdog_loop(self):
         while self.is_running:
             time.sleep(1)
+            now = time.time()
             with self.lock:
                 has_tokens = bool(self.active_tokens)
-                quiet_for = time.time() - self.last_update
-            if has_tokens and quiet_for > ORDER_BOOK_STALE_SECONDS:
-                sys.stdout.write(f"\n⚠️ Order book quiet for {quiet_for:.0f}s, reconnecting...\n")
+                connected = self.connected
+                quiet_for = now - self.last_update
+                down_for = now - self.disconnected_at if self.disconnected_at else 0.0
+            if not has_tokens:
+                continue
+            if connected and quiet_for > ORDER_BOOK_STALE_SECONDS:
+                sys.stdout.write(f"\n⚠️ Order book quiet for {quiet_for:.0f}s while connected, reconnecting...\n")
+                sys.stdout.flush()
+                self._reconnect()
+            elif not connected and down_for > ORDER_BOOK_CONNECT_TIMEOUT_SECONDS:
+                sys.stdout.write(f"\n⚠️ Order book not connected after {down_for:.0f}s, retrying...\n")
                 sys.stdout.flush()
                 with self.lock:
-                    self.last_update = time.time()
-                self._reconnect()
+                    self.disconnected_at = now
+                ws = self.ws
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
 
     def _send_subscription(self, ws, token_ids):
         try:
@@ -212,16 +247,26 @@ class PersistentPolymarketWS:
 
     def _on_open(self, ws):
         ws_state["connected"] = True
+        now = time.time()
         with self.lock:
-            self.last_update = time.time()
+            took = now - self.disconnected_at if self.disconnected_at else 0.0
+            verb = "reconnected" if self.ever_connected else "connected"
+            self.connected = True
+            self.ever_connected = True
+            self.disconnected_at = None
+            self.last_update = now
             if self.active_tokens:
                 self._send_subscription(ws, self.active_tokens)
+        sys.stdout.write(f"\n🔌 Order book {verb} in {took:.1f}s\n")
+        sys.stdout.flush()
 
     def _on_close(self, ws, code, msg):
         ws_state["connected"] = False
+        self._mark_disconnected()
 
     def _on_error(self, ws, error):
         ws_state["connected"] = False
+        self._mark_disconnected()
 
     def _run_loop(self):
         ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

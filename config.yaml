@@ -73,4 +73,5 @@ strategies:
     early_check_fractions: [0.25, 0.3333]  # log-only: Up/Down prices and gaps at these shares of the window (11:15 and 10:00 left on 15m)
     decision_tolerance_seconds: 60 # give up if no price/asks within this long after the decision point
     cancel_remaining_seconds: 0    # cancel unfilled limits with this many seconds left; 0 = never
+    cancel_move: 0.10              # after entry, if no side has filled, cancel both limits once the PM or Binance gap exceeds this; 0 = never
     # trades → {coin}-{duration}-flat-dual-trades.csv

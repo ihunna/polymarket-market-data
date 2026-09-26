@@ -2047,6 +2047,8 @@ class FlatDualOpenTrade:
     entry_down: float | None = None
     up_resting: bool = False
     down_resting: bool = False
+    up_cancelled: bool = False
+    down_cancelled: bool = False
     notes: str = ""
 
 
@@ -2072,6 +2074,7 @@ class FlatDualSimulator:
         self.decision_remaining_seconds = self.duration_seconds * (1.0 - self.decision_fraction)
         self.decision_tolerance_seconds = float(cfg.get("decision_tolerance_seconds", 60))
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
+        self.cancel_move = float(cfg.get("cancel_move", 0))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2135,14 +2138,16 @@ class FlatDualSimulator:
         if window_start is not None and window_start in self.open_trades:
             trade = self.open_trades[window_start]
             legs = []
-            for side, filled, resting in (
-                ("Up", trade.up_filled, trade.up_resting),
-                ("Down", trade.down_filled, trade.down_resting),
+            for side, filled, resting, cancelled in (
+                ("Up", trade.up_filled, trade.up_resting, trade.up_cancelled),
+                ("Down", trade.down_filled, trade.down_resting, trade.down_cancelled),
             ):
                 if filled:
                     legs.append(f"{side}✓")
                 elif resting:
                     legs.append(f"{side}@{self.limit_cents}¢")
+                elif cancelled:
+                    legs.append(f"{side}✗")
             return f"FD {trade.contracts}c [{' '.join(legs)}]"
         return self.status_line
 
@@ -2304,16 +2309,57 @@ class FlatDualSimulator:
         else:
             trade.down_resting = True
 
-    def _update_fills(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
+    def _update_fills(
+        self,
+        trade: FlatDualOpenTrade,
+        remaining: float,
+        up_ask: float,
+        down_ask: float,
+        price_to_beat: float,
+        current_price: float,
+    ) -> None:
         if self.cancel_remaining_seconds > 0 and remaining <= self.cancel_remaining_seconds:
             if trade.up_resting or trade.down_resting:
+                trade.up_cancelled = trade.up_resting
+                trade.down_cancelled = trade.down_resting
                 trade.up_resting = trade.down_resting = False
                 trade.notes = ";".join(n for n in (trade.notes, "resting_cancelled") if n)
+            return
+        # Checked before fills so a big move cancels the limit before its ask crosses it.
+        if self._cancel_on_move(trade, remaining, price_to_beat, current_price):
             return
         if trade.up_resting and 0.0 < up_ask <= self.limit_price:
             self._fill(trade, "Up", self.limit_price)
         if trade.down_resting and 0.0 < down_ask <= self.limit_price:
             self._fill(trade, "Down", self.limit_price)
+
+    def _cancel_on_move(
+        self, trade: FlatDualOpenTrade, remaining: float, price_to_beat: float, current_price: float
+    ) -> bool:
+        if self.cancel_move <= 0 or price_to_beat <= 0:
+            return False
+        if trade.up_filled or trade.down_filled or not (trade.up_resting and trade.down_resting):
+            return False
+        deltas = []
+        if current_price > 0:
+            deltas.append(("gap", round(current_price - price_to_beat, 2)))
+        if self._binance_price > 0:
+            deltas.append(("binance", round(self._binance_price - price_to_beat, 2)))
+        trigger = next(((name, d) for name, d in deltas if abs(d) > self.cancel_move), None)
+        if trigger is None:
+            return False
+        sides = [s for s, r in (("up", trade.up_resting), ("down", trade.down_resting)) if r]
+        trade.up_cancelled = trade.up_resting
+        trade.down_cancelled = trade.down_resting
+        trade.up_resting = trade.down_resting = False
+        detail = " ".join(f"{name}={d:+.2f}" for name, d in deltas)
+        note = f"cancelled_{'_'.join(sides)} {detail} at {_format_mmss(remaining)}"
+        trade.notes = ";".join(n for n in (trade.notes, note) if n)
+        self._print_event(
+            f"🛑 [flat_dual] cancelled {'/'.join(s.title() for s in sides)} limit | {trigger[0]} moved | "
+            f"{detail} > {self.cancel_move:.2f} | {_format_mmss(remaining)} left | {trade.slug}"
+        )
+        return True
 
     def _track_gap(self, window_start: int, price_to_beat: float, current_price: float) -> None:
         if window_start in self._decided_windows or current_price <= 0 or price_to_beat <= 0:
@@ -2401,7 +2447,7 @@ class FlatDualSimulator:
             self._last_asks[window_start] = (up_ask, down_ask)
         trade = self.open_trades.get(window_start)
         if trade is not None:
-            self._update_fills(trade, remaining_seconds, up_ask, down_ask)
+            self._update_fills(trade, remaining_seconds, up_ask, down_ask, price_to_beat, current_price)
             return
         self._try_enter(window_start, price_to_beat, current_price, remaining_seconds, up_ask, down_ask)
 

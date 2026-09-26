@@ -83,6 +83,10 @@ FLAT_DUAL_TRADES_HEADER = [
     "start_gap",
     "max_gap_before_entry",
     "min_gap_before_entry",
+    "up_lowest_before_decision",
+    "up_lowest_time_left",
+    "down_lowest_before_decision",
+    "down_lowest_time_left",
     "gap_at_entry",
     "final_gap",
     "binance_gap_at_entry",
@@ -2093,6 +2097,7 @@ class FlatDualSimulator:
         self._gaps: dict[int, dict[str, float]] = {}
         self._first_seen: dict[int, float] = {}
         self._early: dict[int, dict[str, Any]] = {}
+        self._ask_lows: dict[int, dict[str, tuple[float, float]]] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
@@ -2318,6 +2323,14 @@ class FlatDualSimulator:
         g["max"] = max(g["max"], gap)
         g["min"] = min(g["min"], gap)
 
+    def _track_asks(self, window_start: int, up_ask: float, down_ask: float, remaining: float) -> None:
+        if window_start in self._decided_windows:
+            return
+        lows = self._ask_lows.setdefault(window_start, {})
+        for side, ask in (("up", up_ask), ("down", down_ask)):
+            if 0.0 < ask <= 1.0 and (side not in lows or ask < lows[side][0]):
+                lows[side] = (ask, remaining)
+
     def _record_early_checks(
         self,
         window_start: int,
@@ -2350,9 +2363,14 @@ class FlatDualSimulator:
     def _gap_fields(self, window_start: int, price_to_beat: float, final_price: float) -> dict[str, Any]:
         g = self._gaps.get(window_start)
         end_up, end_down = self._last_asks.get(window_start, (0.0, 0.0))
+        lows = self._ask_lows.get(window_start, {})
         final_gap = final_price - price_to_beat if final_price > 0 and price_to_beat > 0 else None
         return {
             **self._early.get(window_start, {}),
+            "up_lowest_before_decision": round(lows["up"][0], 2) if "up" in lows else "",
+            "up_lowest_time_left": _format_mmss(lows["up"][1]) if "up" in lows else "",
+            "down_lowest_before_decision": round(lows["down"][0], 2) if "down" in lows else "",
+            "down_lowest_time_left": _format_mmss(lows["down"][1]) if "down" in lows else "",
             "up_ask_at_end": round(end_up, 2) if end_up > 0 else "",
             "down_ask_at_end": round(end_down, 2) if end_down > 0 else "",
             "start_gap": round(g["start"], 2) if g else "",
@@ -2375,6 +2393,7 @@ class FlatDualSimulator:
         self._binance_price = binance_price
         self._first_seen.setdefault(window_start, remaining_seconds)
         self._track_gap(window_start, price_to_beat, current_price)
+        self._track_asks(window_start, up_ask, down_ask, remaining_seconds)
         self._record_early_checks(
             window_start, price_to_beat, current_price, remaining_seconds, up_ask, down_ask
         )
@@ -2401,6 +2420,7 @@ class FlatDualSimulator:
         self._gaps = {w: g for w, g in self._gaps.items() if w > window_start}
         self._first_seen = {w: s for w, s in self._first_seen.items() if w > window_start}
         self._early = {w: v for w, v in self._early.items() if w > window_start}
+        self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)

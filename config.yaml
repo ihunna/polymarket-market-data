@@ -66,7 +66,7 @@ strategies:
     capital: 100.0
     investable_per_trade: 5.0
     capital_mode: locked
-    limit_cents: 30                # per-side price; a side already below this is bought at its ask
+    limit_cents: 40                # per-side price; a side already below this is bought at its ask
     max_move: 0.10                 # max |price - price_to_beat| at the decision point
     max_binance_move: 0.10         # max |binance - price_to_beat| at the decision point; ignored (pm_only) if no Binance price
     decision_fraction: 0.33334     # decide once this share of the window has elapsed (10:00 left on 15m)

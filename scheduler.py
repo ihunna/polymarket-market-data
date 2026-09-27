@@ -303,6 +303,8 @@ PRICE_STALE_SECONDS = 15
 PRICE_HISTORY_SECONDS = 3900
 PRICE_BOUNDARY_TOLERANCE_SECONDS = 10
 PRICE_END_WAIT_SECONDS = 15
+PRICE_QUIET_SECONDS = 15
+PRICE_CONNECT_TIMEOUT_SECONDS = 60
 
 
 PRICE_TOPIC = "crypto_prices_twap_sixty"
@@ -321,8 +323,12 @@ class PersistentPriceWS:
         self.lock = threading.Lock()
         self.prices = deque()
         self.binance_latest = (0, 0.0)
+        self.last_tick = time.time()
+        self.ever_connected = False
+        self.disconnected_at = time.time()
         threading.Thread(target=self._run_loop, daemon=True).start()
         threading.Thread(target=self._ping_loop, daemon=True).start()
+        threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
     def _subscribe(self, ws):
         # The server matches live updates against the exact filter text; it must be
@@ -345,7 +351,16 @@ class PersistentPriceWS:
         }, **compact))
 
     def _on_open(self, ws):
-        self.connected = True
+        now = time.time()
+        with self.lock:
+            took = now - self.disconnected_at if self.disconnected_at else 0.0
+            verb = "reconnected" if self.ever_connected else "connected"
+            self.connected = True
+            self.ever_connected = True
+            self.disconnected_at = None
+            self.last_tick = now
+        sys.stdout.write(f"\n🔌 Price socket {verb} in {took:.1f}s\n")
+        sys.stdout.flush()
         try:
             self._subscribe(ws)
         except Exception:
@@ -380,6 +395,7 @@ class PersistentPriceWS:
                 if ts <= 0 or value <= 0:
                     continue
                 if topic == PRICE_TOPIC and symbol == self.price_symbol:
+                    self.last_tick = time.time()
                     self._add_price(ts, value)
                 elif topic == BINANCE_TOPIC and symbol == self.binance_symbol:
                     with self.lock:
@@ -428,11 +444,45 @@ class PersistentPriceWS:
             time.sleep(0.25)
         return self.price_at(epoch_seconds)
 
+    def _mark_disconnected(self):
+        with self.lock:
+            if self.connected or self.disconnected_at is None:
+                self.disconnected_at = time.time()
+            self.connected = False
+
+    def _close_ws(self):
+        ws = self.ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
     def _on_close(self, ws, code, msg):
-        self.connected = False
+        self._mark_disconnected()
 
     def _on_error(self, ws, error):
-        self.connected = False
+        self._mark_disconnected()
+
+    def _watchdog_loop(self):
+        while self.is_running:
+            time.sleep(1)
+            now = time.time()
+            with self.lock:
+                connected = self.connected
+                quiet_for = now - self.last_tick
+                down_for = now - self.disconnected_at if self.disconnected_at else 0.0
+            if connected and quiet_for > PRICE_QUIET_SECONDS:
+                sys.stdout.write(f"\n⚠️ Price socket quiet for {quiet_for:.0f}s while connected, reconnecting...\n")
+                sys.stdout.flush()
+                self._mark_disconnected()
+                self._close_ws()
+            elif not connected and down_for > PRICE_CONNECT_TIMEOUT_SECONDS:
+                sys.stdout.write(f"\n⚠️ Price socket not connected after {down_for:.0f}s, retrying...\n")
+                sys.stdout.flush()
+                with self.lock:
+                    self.disconnected_at = now
+                self._close_ws()
 
     def _ping_loop(self):
         while self.is_running:
@@ -454,10 +504,10 @@ class PersistentPriceWS:
                     on_close=self._on_close,
                     on_error=self._on_error,
                 )
-                self.ws.run_forever(origin=PRICE_WS_ORIGIN)
+                self.ws.run_forever(origin=PRICE_WS_ORIGIN, ping_interval=20, ping_timeout=10)
             except Exception:
                 pass
-            self.connected = False
+            self._mark_disconnected()
             if self.is_running:
                 time.sleep(2)
 

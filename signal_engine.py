@@ -107,6 +107,8 @@ FLAT_DUAL_TRADES_HEADER = [
     "down_ask_at_entry",
     "up_ask_at_end",
     "down_ask_at_end",
+    "up_low_last_interval",
+    "down_low_last_interval",
     "entry_mode",
     "capital_before",
     "free_capital_before",
@@ -2149,7 +2151,7 @@ class FlatDualSimulator:
         early_columns = [
             f"early{i}_{name}"
             for i in range(1, len(self.early_check_remaining) + 1)
-            for name in ("time_left", "gap", "binance_gap", "up_ask", "down_ask")
+            for name in ("time_left", "gap", "binance_gap", "up_ask", "down_ask", "up_low", "down_low")
         ]
         split = FLAT_DUAL_TRADES_HEADER.index("gap_at_entry")
         self.trades_header = FLAT_DUAL_TRADES_HEADER[:split] + early_columns + FLAT_DUAL_TRADES_HEADER[split:]
@@ -2171,6 +2173,7 @@ class FlatDualSimulator:
         self._early: dict[int, dict[str, Any]] = {}
         self._ask_lows: dict[int, dict[str, tuple[float, float]]] = {}
         self._ask_lows_after: dict[int, dict[str, tuple[float, float]]] = {}
+        self._interval_lows: dict[int, dict[str, float]] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
@@ -2519,6 +2522,10 @@ class FlatDualSimulator:
         for side, ask in (("up", up_ask), ("down", down_ask)):
             if 0.0 < ask <= 1.0 and (side not in lows or ask < lows[side][0]):
                 lows[side] = (ask, remaining)
+        interval = self._interval_lows.setdefault(window_start, {})
+        for side, ask in (("up", up_ask), ("down", down_ask)):
+            if 0.0 < ask <= 1.0 and ask < interval.get(side, 2.0):
+                interval[side] = ask
 
     def _record_early_checks(
         self,
@@ -2543,6 +2550,10 @@ class FlatDualSimulator:
             fields[f"early{i}_binance_gap"] = self._binance_gap(price_to_beat)
             fields[f"early{i}_up_ask"] = round(up_ask, 2) if up_ask > 0 else ""
             fields[f"early{i}_down_ask"] = round(down_ask, 2) if down_ask > 0 else ""
+            # Lowest asks since the previous snapshot (or the window start for the first one).
+            interval = self._interval_lows.pop(window_start, {})
+            fields[f"early{i}_up_low"] = round(interval["up"], 2) if "up" in interval else ""
+            fields[f"early{i}_down_low"] = round(interval["down"], 2) if "down" in interval else ""
 
     def _binance_gap_value(self) -> float | None:
         # Binance SOL/USDT trades a few cents off the settlement SOL/USD price, so it is
@@ -2561,6 +2572,7 @@ class FlatDualSimulator:
         end_up, end_down = self._last_asks.get(window_start, (0.0, 0.0))
         lows = self._ask_lows.get(window_start, {})
         after = self._ask_lows_after.get(window_start, {})
+        tail = self._interval_lows.get(window_start, {})
         final_gap = final_price - price_to_beat if final_price > 0 and price_to_beat > 0 else None
         return {
             **self._early.get(window_start, {}),
@@ -2574,6 +2586,8 @@ class FlatDualSimulator:
             "down_lowest_after_time_left": _format_mmss(after["down"][1]) if "down" in after else "",
             "up_ask_at_end": round(end_up, 2) if end_up > 0 else "",
             "down_ask_at_end": round(end_down, 2) if end_down > 0 else "",
+            "up_low_last_interval": round(tail["up"], 2) if "up" in tail else "",
+            "down_low_last_interval": round(tail["down"], 2) if "down" in tail else "",
             "start_gap": round(g["start"], 2) if g else "",
             "max_gap_before_entry": round(g["max"], 2) if g else "",
             "min_gap_before_entry": round(g["min"], 2) if g else "",
@@ -2635,6 +2649,7 @@ class FlatDualSimulator:
         self._early = {w: v for w, v in self._early.items() if w > window_start}
         self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}
         self._ask_lows_after = {w: v for w, v in self._ask_lows_after.items() if w > window_start}
+        self._interval_lows = {w: v for w, v in self._interval_lows.items() if w > window_start}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)

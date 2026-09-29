@@ -6,8 +6,8 @@ duration_minutes: 15
 mode: simulate                    # simulate | paper | live
 
 market_bias:
-  # off | ref | rolling | ema
-  mode: rolling
+  # off | ref | rolling | ema | daily_open
+  mode: daily_open
   # ref mode
   reference_price: null          # float, e.g. 107.0
   ref_set_timestamp: null        # unix int when ref was set; optional
@@ -17,6 +17,8 @@ market_bias:
   # ema mode
   ema_period: 96
   ema_band: 0.75
+  # daily_open mode: trend = price now minus the price at this UTC hour today (0 = daily candle open, 13.5 = US stock open)
+  anchor_hour_utc: 0
   # shared
   strong_move: 1.5
 

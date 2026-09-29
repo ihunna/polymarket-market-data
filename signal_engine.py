@@ -94,6 +94,9 @@ FLAT_DUAL_TRADES_HEADER = [
     "gap_at_entry",
     "final_gap",
     "binance_gap_at_entry",
+    "trend_open",
+    "trend_move",
+    "trend_bias",
     "max_move",
     "limit_cents",
     "up_ask_at_entry",
@@ -127,7 +130,7 @@ FLAT_DUAL_TRADES_HEADER = [
 
 HISTORY_LIMIT = 20
 REGIME_HISTORY_LIMIT = 400
-VALID_BIAS_MODES = ("off", "ref", "rolling", "ema")
+VALID_BIAS_MODES = ("off", "ref", "rolling", "ema", "daily_open")
 
 DUAL_HEDGE_REQUIRED = [
     "enabled",
@@ -275,7 +278,7 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     else:
         mode = str(market_bias.get("mode") or "off").strip().lower()
         if mode not in VALID_BIAS_MODES:
-            raise ValueError("market_bias.mode must be one of: off, ref, rolling, ema")
+            raise ValueError("market_bias.mode must be one of: " + ", ".join(VALID_BIAS_MODES))
         market_bias["mode"] = mode
 
     data["_config_duration_minutes"] = int(data["duration_minutes"])
@@ -502,8 +505,10 @@ class RegimeEngine:
         ema_period: int = 96,
         ema_band: float = 0.75,
         strong_move: float = 1.5,
+        anchor_hour_utc: float = 0.0,
     ):
         self.mode = mode if mode in VALID_BIAS_MODES else "off"
+        self.anchor_hour_utc = float(anchor_hour_utc) % 24
         self.duration_seconds = int(duration_seconds) if duration_seconds else 900
         self.reference_price = reference_price
         self.ref_set_timestamp = ref_set_timestamp
@@ -552,6 +557,7 @@ class RegimeEngine:
             ema_period=int(cfg.get("ema_period", 96)),
             ema_band=float(cfg.get("ema_band", 0.75)),
             strong_move=float(cfg.get("strong_move", 1.5)),
+            anchor_hour_utc=float(cfg.get("anchor_hour_utc", 0.0)),
         )
 
     def _apply_ema(self, price: float) -> None:
@@ -620,7 +626,24 @@ class RegimeEngine:
             return max(0, int((now_window - ref_window) / self.duration_seconds))
         return self._runtime_updates
 
-    def get_state(self, current_price: float | None = None) -> RegimeState:
+    def daily_anchor(self, now: float | None = None) -> int:
+        """Most recent anchor time (anchor_hour_utc each day) at or before ``now``."""
+        ts = time.time() if now is None else float(now)
+        offset = self.anchor_hour_utc * 3600
+        return int(ts - ((ts - offset) % 86400))
+
+    def daily_open(self, now: float | None = None) -> float | None:
+        # A window's open is the previous window's close, so the anchor's open is the
+        # close of the window that ended at the anchor.
+        target = self.daily_anchor(now) - self.duration_seconds
+        for ws, price in zip(reversed(self.window_starts), reversed(self.prices)):
+            if ws == target:
+                return price
+            if ws < target:
+                break
+        return None
+
+    def get_state(self, current_price: float | None = None, now: float | None = None) -> RegimeState:
         mode = self.mode
         if mode == "off":
             return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
@@ -709,6 +732,20 @@ class RegimeEngine:
                 ema_value=ema_now,
             )
 
+        if mode == "daily_open":
+            open_price = self.daily_open(now)
+            if current is None or open_price is None:
+                return RegimeState(
+                    bias="neutral", move_amount=0.0, mode=mode, reference_price=open_price
+                )
+            move = current - open_price
+            return RegimeState(
+                bias=_signed_bias(move, self.strong_move),
+                move_amount=move,
+                mode=mode,
+                reference_price=open_price,
+            )
+
         return RegimeState(bias="neutral", move_amount=0.0, mode=mode)
 
     def summarize_line(self) -> str:
@@ -723,6 +760,10 @@ class RegimeEngine:
             extra = f" ref={state.reference_price}" if state.reference_price is not None else " ref=null"
             if state.ref_age_windows is not None:
                 extra += f" age={state.ref_age_windows}"
+        elif self.mode == "daily_open":
+            anchor = time.strftime("%H:%M", time.gmtime(self.anchor_hour_utc * 3600))
+            open_text = f"{state.reference_price:.2f}" if state.reference_price is not None else "missing"
+            extra = f" open={open_text} anchor={anchor}UTC"
         return f"regime: mode={state.mode} bias={state.bias} move={state.move_amount:.2f}{extra}"
 
 
@@ -2064,6 +2105,7 @@ class FlatDualOpenTrade:
     one_side_max_bid: float = 0.0
     one_side_max_bid_left: float | None = None
     one_side_paired_left: float | None = None
+    trend: dict[str, Any] | None = None
     notes: str = ""
 
 
@@ -2074,11 +2116,17 @@ class FlatDualSimulator:
     rests a limit at ``limit_cents`` and fills only on asks observed after entry.
     """
 
-    def __init__(self, global_config: dict[str, Any], strategy_config: dict[str, Any]):
+    def __init__(
+        self,
+        global_config: dict[str, Any],
+        strategy_config: dict[str, Any],
+        regime: RegimeEngine | None = None,
+    ):
         self.duration_minutes = int(global_config["duration_minutes"])
         self.duration_seconds = self.duration_minutes * 60
         self.coin = str(global_config["coin"])
         self.mode = str(global_config["mode"])
+        self.regime = regime
 
         cfg = strategy_config
         self.limit_cents = int(cfg["limit_cents"])
@@ -2168,6 +2216,16 @@ class FlatDualSimulator:
             return f"FD {trade.contracts}c [{' '.join(legs)}]"
         return self.status_line
 
+    def _trend_fields(self, window_start: int, current_price: float) -> dict[str, Any]:
+        if self.regime is None or self.regime.mode == "off" or current_price <= 0:
+            return {}
+        state = self.regime.get_state(current_price, now=window_start)
+        return {
+            "trend_open": round(state.reference_price, 2) if state.reference_price is not None else "",
+            "trend_move": round(state.move_amount, 2),
+            "trend_bias": state.bias,
+        }
+
     def _log_skip(
         self,
         window_start: int,
@@ -2189,6 +2247,7 @@ class FlatDualSimulator:
                 "price_at_entry": round(current_price, 2) if current_price else "",
                 "gap_at_entry": round(gap, 2) if gap != "" else "",
                 "binance_gap_at_entry": self._binance_gap(price_to_beat),
+                **self._trend_fields(window_start, current_price),
                 "max_move": self.max_move,
                 "limit_cents": self.limit_cents,
                 "up_ask_at_entry": round(up_ask, 2),
@@ -2291,6 +2350,7 @@ class FlatDualSimulator:
             invested_amount=round(required_cost, 2),
             contracts=contracts,
             binance_gap=self._binance_gap(price_to_beat),
+            trend=self._trend_fields(window_start, current_price),
             notes="" if binance_gap is not None else "pm_only",
         )
 
@@ -2576,6 +2636,7 @@ class FlatDualSimulator:
                 "price_at_entry": round(trade.price_at_entry, 2),
                 "gap_at_entry": trade.gap_at_entry,
                 "binance_gap_at_entry": trade.binance_gap,
+                **(trade.trend or {}),
                 "max_move": self.max_move,
                 "limit_cents": self.limit_cents,
                 "up_ask_at_entry": round(trade.up_ask_at_entry, 2),
@@ -2652,7 +2713,7 @@ class StrategyRunner:
 
         fd_cfg = strategies_cfg.get("flat_dual")
         if isinstance(fd_cfg, dict) and fd_cfg.get("enabled"):
-            flat_dual = FlatDualSimulator(config, fd_cfg)
+            flat_dual = FlatDualSimulator(config, fd_cfg, regime=regime)
             enabled.append(flat_dual)
             max_decision = max(max_decision, flat_dual.decision_remaining_seconds)
 

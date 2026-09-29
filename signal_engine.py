@@ -83,6 +83,10 @@ FLAT_DUAL_TRADES_HEADER = [
     "start_gap",
     "max_gap_before_entry",
     "min_gap_before_entry",
+    "flips_before_entry",
+    "last_flip_before_time_left",
+    "flips_after_entry",
+    "last_flip_after_time_left",
     "up_lowest_before_decision",
     "up_lowest_time_left",
     "down_lowest_before_decision",
@@ -2138,6 +2142,7 @@ class FlatDualSimulator:
         self.decision_tolerance_seconds = float(cfg.get("decision_tolerance_seconds", 60))
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
         self.cancel_move = float(cfg.get("cancel_move", 0))
+        self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2161,6 +2166,7 @@ class FlatDualSimulator:
         self.open_trades: dict[int, FlatDualOpenTrade] = {}
         self._decided_windows: set[int] = set()
         self._gaps: dict[int, dict[str, float]] = {}
+        self._flips: dict[int, dict[str, Any]] = {}
         self._first_seen: dict[int, float] = {}
         self._early: dict[int, dict[str, Any]] = {}
         self._ask_lows: dict[int, dict[str, tuple[float, float]]] = {}
@@ -2486,6 +2492,27 @@ class FlatDualSimulator:
         g["max"] = max(g["max"], gap)
         g["min"] = min(g["min"], gap)
 
+    def _track_flips(
+        self, window_start: int, price_to_beat: float, current_price: float, remaining: float
+    ) -> None:
+        if current_price <= 0 or price_to_beat <= 0:
+            return
+        gap = current_price - price_to_beat
+        if gap >= self.flip_margin:
+            side = 1
+        elif gap <= -self.flip_margin:
+            side = -1
+        else:
+            # Inside the margin the gap keeps its last side, so wobbles around zero don't count.
+            return
+        f = self._flips.setdefault(window_start, {"side": side, "before": 0, "after": 0})
+        if side == f["side"]:
+            return
+        f["side"] = side
+        phase = "after" if window_start in self._decided_windows else "before"
+        f[phase] += 1
+        f[f"last_{phase}"] = remaining
+
     def _track_asks(self, window_start: int, up_ask: float, down_ask: float, remaining: float) -> None:
         store = self._ask_lows_after if window_start in self._decided_windows else self._ask_lows
         lows = store.setdefault(window_start, {})
@@ -2530,6 +2557,7 @@ class FlatDualSimulator:
 
     def _gap_fields(self, window_start: int, price_to_beat: float, final_price: float) -> dict[str, Any]:
         g = self._gaps.get(window_start)
+        flips = self._flips.get(window_start, {})
         end_up, end_down = self._last_asks.get(window_start, (0.0, 0.0))
         lows = self._ask_lows.get(window_start, {})
         after = self._ask_lows_after.get(window_start, {})
@@ -2549,6 +2577,14 @@ class FlatDualSimulator:
             "start_gap": round(g["start"], 2) if g else "",
             "max_gap_before_entry": round(g["max"], 2) if g else "",
             "min_gap_before_entry": round(g["min"], 2) if g else "",
+            "flips_before_entry": flips["before"] if flips else "",
+            "last_flip_before_time_left": (
+                _format_mmss(flips["last_before"]) if "last_before" in flips else ""
+            ),
+            "flips_after_entry": flips["after"] if flips else "",
+            "last_flip_after_time_left": (
+                _format_mmss(flips["last_after"]) if "last_after" in flips else ""
+            ),
             "final_gap": round(final_gap, 2) if final_gap is not None else "",
         }
 
@@ -2568,6 +2604,7 @@ class FlatDualSimulator:
         self._binance_price_to_beat = binance_price_to_beat
         self._first_seen.setdefault(window_start, remaining_seconds)
         self._track_gap(window_start, price_to_beat, current_price)
+        self._track_flips(window_start, price_to_beat, current_price, remaining_seconds)
         self._track_asks(window_start, up_ask, down_ask, remaining_seconds)
         self._record_early_checks(
             window_start, price_to_beat, current_price, remaining_seconds, up_ask, down_ask
@@ -2593,6 +2630,7 @@ class FlatDualSimulator:
         gap_fields = self._gap_fields(window_start, price_to_beat, final_price)
         self._decided_windows = {w for w in self._decided_windows if w >= window_start}
         self._gaps = {w: g for w, g in self._gaps.items() if w > window_start}
+        self._flips = {w: f for w, f in self._flips.items() if w > window_start}
         self._first_seen = {w: s for w, s in self._first_seen.items() if w > window_start}
         self._early = {w: v for w, v in self._early.items() if w > window_start}
         self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}

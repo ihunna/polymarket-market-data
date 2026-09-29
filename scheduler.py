@@ -75,6 +75,8 @@ def format_dollar(price):
 def format_ticker(label, price, price_to_beat):
     if price <= 0:
         return f"{label}: --"
+    if price_to_beat <= 0:
+        return f"{label}: {format_dollar(price)} (--)"
     return f"{label}: {format_dollar(price)} ({price - price_to_beat:+.2f})"
 
 def format_token_cents(raw):
@@ -323,6 +325,7 @@ class PersistentPriceWS:
         self.lock = threading.Lock()
         self.prices = deque()
         self.binance_latest = (0, 0.0)
+        self.binance_prices = deque()
         self.last_tick = time.time()
         self.ever_connected = False
         self.disconnected_at = time.time()
@@ -401,15 +404,20 @@ class PersistentPriceWS:
                     with self.lock:
                         if ts >= self.binance_latest[0]:
                             self.binance_latest = (ts, value)
+                        self._append_history(self.binance_prices, ts, value)
 
     def _add_price(self, ts, value):
         with self.lock:
-            if self.prices and ts <= self.prices[-1][0]:
-                return
-            self.prices.append((ts, value))
-            cutoff = ts - PRICE_HISTORY_SECONDS * 1000
-            while self.prices and self.prices[0][0] < cutoff:
-                self.prices.popleft()
+            self._append_history(self.prices, ts, value)
+
+    @staticmethod
+    def _append_history(series, ts, value):
+        if series and ts <= series[-1][0]:
+            return
+        series.append((ts, value))
+        cutoff = ts - PRICE_HISTORY_SECONDS * 1000
+        while series and series[0][0] < cutoff:
+            series.popleft()
 
     def latest_price(self):
         with self.lock:
@@ -425,9 +433,16 @@ class PersistentPriceWS:
 
     def price_at(self, epoch_seconds):
         """Last streamed price at or before ``epoch_seconds``; 0.0 if none close enough."""
+        return self._value_at(self.prices, epoch_seconds)
+
+    def binance_at(self, epoch_seconds):
+        """Last Binance price at or before ``epoch_seconds``; 0.0 if none close enough."""
+        return self._value_at(self.binance_prices, epoch_seconds)
+
+    def _value_at(self, series, epoch_seconds):
         target = epoch_seconds * 1000
         with self.lock:
-            for ts, value in reversed(self.prices):
+            for ts, value in reversed(series):
                 if ts <= target:
                     return value if target - ts <= PRICE_BOUNDARY_TOLERANCE_SECONDS * 1000 else 0.0
         return 0.0
@@ -616,6 +631,7 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
         current_price = price_ws.latest_price()
         binance_price = price_ws.latest_binance()
         gap_ptb = price_ws.price_at(window_start) or price_to_beat
+        binance_ptb = price_ws.binance_at(window_start)
 
         if simulator is not None:
             simulator.on_window_update(
@@ -629,6 +645,7 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
                 down_ask=down_cost,
                 inferred_outcome=None,
                 binance_price=binance_price,
+                binance_price_to_beat=binance_ptb,
             )
 
         up_cents = format_token_cents(up_cost)
@@ -639,7 +656,7 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
             sim_bit = f" | {simulator.display_status(window_start)}"
         display_str = (
             f"PTB: {format_dollar(gap_ptb)} | {format_ticker('PM', current_price, gap_ptb)} | "
-            f"{format_ticker('Binance', binance_price, gap_ptb)} | Up: {up_cents} | Down: {down_cents}{sim_bit}"
+            f"{format_ticker('Binance', binance_price, binance_ptb)} | Up: {up_cents} | Down: {down_cents}{sim_bit}"
         )
         update_window_progress(window_start, window_end, formatted_message=display_str)
         

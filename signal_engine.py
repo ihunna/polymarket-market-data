@@ -87,6 +87,10 @@ FLAT_DUAL_TRADES_HEADER = [
     "up_lowest_time_left",
     "down_lowest_before_decision",
     "down_lowest_time_left",
+    "up_lowest_after_decision",
+    "up_lowest_after_time_left",
+    "down_lowest_after_decision",
+    "down_lowest_after_time_left",
     "gap_at_entry",
     "final_gap",
     "binance_gap_at_entry",
@@ -107,6 +111,12 @@ FLAT_DUAL_TRADES_HEADER = [
     "fill_type",
     "entry_up",
     "entry_down",
+    "one_side_filled",
+    "one_side_fill_time_left",
+    "one_side_max_bid",
+    "one_side_max_bid_time_left",
+    "one_side_bid_at_end",
+    "one_side_paired_time_left",
     "outcome",
     "pnl",
     "capital_after",
@@ -818,7 +828,7 @@ class DualHedgeSimulator:
                 existing = next(csv.reader(f), None)
             if existing == TRADES_HEADER:
                 return
-            archived = f"{path}.bak"
+            archived = f"{path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
             os.replace(path, archived)
             print(f"⚠️  Trades log schema updated; old file moved to {archived}")
         with open(path, mode="a", newline="", encoding="utf-8") as f:
@@ -1459,7 +1469,7 @@ class OppositeSideSimulator:
                 existing = next(csv.reader(f), None)
             if existing == OPPOSITE_TRADES_HEADER:
                 return
-            archived = f"{path}.bak"
+            archived = f"{path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
             os.replace(path, archived)
             print(f"⚠️  Opposite trades log schema updated; old file moved to {archived}")
         with open(path, mode="a", newline="", encoding="utf-8") as f:
@@ -2049,6 +2059,11 @@ class FlatDualOpenTrade:
     down_resting: bool = False
     up_cancelled: bool = False
     down_cancelled: bool = False
+    one_side: str = ""
+    one_side_fill_left: float | None = None
+    one_side_max_bid: float = 0.0
+    one_side_max_bid_left: float | None = None
+    one_side_paired_left: float | None = None
     notes: str = ""
 
 
@@ -2101,9 +2116,11 @@ class FlatDualSimulator:
         self._first_seen: dict[int, float] = {}
         self._early: dict[int, dict[str, Any]] = {}
         self._ask_lows: dict[int, dict[str, tuple[float, float]]] = {}
+        self._ask_lows_after: dict[int, dict[str, tuple[float, float]]] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
+        self._binance_price_to_beat = 0.0
         self.status_line = "fd: idle"
 
         self._ensure_trades_header()
@@ -2115,7 +2132,7 @@ class FlatDualSimulator:
                 existing = next(csv.reader(f), None)
             if existing == self.trades_header:
                 return
-            archived = f"{path}.bak"
+            archived = f"{path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
             os.replace(path, archived)
             print(f"⚠️  Flat-dual trades log schema updated; old file moved to {archived}")
         with open(path, mode="a", newline="", encoding="utf-8") as f:
@@ -2224,7 +2241,7 @@ class FlatDualSimulator:
 
         self._decided_windows.add(window_start)
         gap = round(current_price - price_to_beat, 2)
-        binance_gap = round(self._binance_price - price_to_beat, 2) if self._binance_price > 0 else None
+        binance_gap = self._binance_gap_value()
         binance_moved = binance_gap is not None and abs(binance_gap) > self.max_binance_move
         if abs(gap) > self.max_move or binance_moved:
             binance_bit = f" binance={binance_gap:+.2f}" if binance_gap is not None else " pm_only"
@@ -2288,6 +2305,7 @@ class FlatDualSimulator:
                 self._fill(trade, side, ask)
             else:
                 self._rest(trade, side)
+        self._track_one_side(trade, remaining, up_ask, down_ask)
 
         self.open_trades[window_start] = trade
         self.status_line = f"fd open {trade.entry_mode}"
@@ -2332,6 +2350,44 @@ class FlatDualSimulator:
             self._fill(trade, "Up", self.limit_price)
         if trade.down_resting and 0.0 < down_ask <= self.limit_price:
             self._fill(trade, "Down", self.limit_price)
+        self._track_one_side(trade, remaining, up_ask, down_ask)
+
+    def _track_one_side(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
+        """Log-only: while exactly one side is held, the best price it could have been sold for."""
+        filled = [s for s, f in (("Up", trade.up_filled), ("Down", trade.down_filled)) if f]
+        if len(filled) == 2:
+            if trade.one_side and trade.one_side_paired_left is None:
+                trade.one_side_paired_left = remaining
+            return
+        if len(filled) != 1:
+            return
+        side = filled[0]
+        if not trade.one_side:
+            trade.one_side, trade.one_side_fill_left = side, remaining
+        # In a two-outcome market the bid for one side is about 1 minus the other side's ask.
+        other_ask = down_ask if side == "Up" else up_ask
+        if 0.0 < other_ask <= 1.0:
+            bid = round(1.0 - other_ask, 2)
+            if bid > trade.one_side_max_bid:
+                trade.one_side_max_bid, trade.one_side_max_bid_left = bid, remaining
+
+    @staticmethod
+    def _one_side_fields(trade: FlatDualOpenTrade, gap_fields: dict[str, Any]) -> dict[str, Any]:
+        if not trade.one_side:
+            return {}
+        other_end = gap_fields.get("down_ask_at_end" if trade.one_side == "Up" else "up_ask_at_end")
+        return {
+            "one_side_filled": trade.one_side,
+            "one_side_fill_time_left": _format_mmss(trade.one_side_fill_left),
+            "one_side_max_bid": trade.one_side_max_bid if trade.one_side_max_bid > 0 else "",
+            "one_side_max_bid_time_left": (
+                _format_mmss(trade.one_side_max_bid_left) if trade.one_side_max_bid_left is not None else ""
+            ),
+            "one_side_bid_at_end": round(1.0 - other_end, 2) if other_end not in ("", None) else "",
+            "one_side_paired_time_left": (
+                _format_mmss(trade.one_side_paired_left) if trade.one_side_paired_left is not None else ""
+            ),
+        }
 
     def _cancel_on_move(
         self, trade: FlatDualOpenTrade, remaining: float, price_to_beat: float, current_price: float
@@ -2343,8 +2399,9 @@ class FlatDualSimulator:
         deltas = []
         if current_price > 0:
             deltas.append(("gap", round(current_price - price_to_beat, 2)))
-        if self._binance_price > 0:
-            deltas.append(("binance", round(self._binance_price - price_to_beat, 2)))
+        binance_gap = self._binance_gap_value()
+        if binance_gap is not None:
+            deltas.append(("binance", binance_gap))
         trigger = next(((name, d) for name, d in deltas if abs(d) > self.cancel_move), None)
         if trigger is None:
             return False
@@ -2370,9 +2427,8 @@ class FlatDualSimulator:
         g["min"] = min(g["min"], gap)
 
     def _track_asks(self, window_start: int, up_ask: float, down_ask: float, remaining: float) -> None:
-        if window_start in self._decided_windows:
-            return
-        lows = self._ask_lows.setdefault(window_start, {})
+        store = self._ask_lows_after if window_start in self._decided_windows else self._ask_lows
+        lows = store.setdefault(window_start, {})
         for side, ask in (("up", up_ask), ("down", down_ask)):
             if 0.0 < ask <= 1.0 and (side not in lows or ask < lows[side][0]):
                 lows[side] = (ask, remaining)
@@ -2401,15 +2457,22 @@ class FlatDualSimulator:
             fields[f"early{i}_up_ask"] = round(up_ask, 2) if up_ask > 0 else ""
             fields[f"early{i}_down_ask"] = round(down_ask, 2) if down_ask > 0 else ""
 
+    def _binance_gap_value(self) -> float | None:
+        # Binance SOL/USDT trades a few cents off the settlement SOL/USD price, so it is
+        # compared with its own price at the window start, not Polymarket's price to beat.
+        if self._binance_price > 0 and self._binance_price_to_beat > 0:
+            return round(self._binance_price - self._binance_price_to_beat, 2)
+        return None
+
     def _binance_gap(self, price_to_beat: float) -> float | str:
-        if self._binance_price > 0 and price_to_beat > 0:
-            return round(self._binance_price - price_to_beat, 2)
-        return ""
+        gap = self._binance_gap_value()
+        return gap if gap is not None else ""
 
     def _gap_fields(self, window_start: int, price_to_beat: float, final_price: float) -> dict[str, Any]:
         g = self._gaps.get(window_start)
         end_up, end_down = self._last_asks.get(window_start, (0.0, 0.0))
         lows = self._ask_lows.get(window_start, {})
+        after = self._ask_lows_after.get(window_start, {})
         final_gap = final_price - price_to_beat if final_price > 0 and price_to_beat > 0 else None
         return {
             **self._early.get(window_start, {}),
@@ -2417,6 +2480,10 @@ class FlatDualSimulator:
             "up_lowest_time_left": _format_mmss(lows["up"][1]) if "up" in lows else "",
             "down_lowest_before_decision": round(lows["down"][0], 2) if "down" in lows else "",
             "down_lowest_time_left": _format_mmss(lows["down"][1]) if "down" in lows else "",
+            "up_lowest_after_decision": round(after["up"][0], 2) if "up" in after else "",
+            "up_lowest_after_time_left": _format_mmss(after["up"][1]) if "up" in after else "",
+            "down_lowest_after_decision": round(after["down"][0], 2) if "down" in after else "",
+            "down_lowest_after_time_left": _format_mmss(after["down"][1]) if "down" in after else "",
             "up_ask_at_end": round(end_up, 2) if end_up > 0 else "",
             "down_ask_at_end": round(end_down, 2) if end_down > 0 else "",
             "start_gap": round(g["start"], 2) if g else "",
@@ -2434,9 +2501,11 @@ class FlatDualSimulator:
         up_ask: float,
         down_ask: float,
         binance_price: float = 0.0,
+        binance_price_to_beat: float = 0.0,
         **_: Any,
     ) -> None:
         self._binance_price = binance_price
+        self._binance_price_to_beat = binance_price_to_beat
         self._first_seen.setdefault(window_start, remaining_seconds)
         self._track_gap(window_start, price_to_beat, current_price)
         self._track_asks(window_start, up_ask, down_ask, remaining_seconds)
@@ -2467,6 +2536,7 @@ class FlatDualSimulator:
         self._first_seen = {w: s for w, s in self._first_seen.items() if w > window_start}
         self._early = {w: v for w, v in self._early.items() if w > window_start}
         self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}
+        self._ask_lows_after = {w: v for w, v in self._ask_lows_after.items() if w > window_start}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)
@@ -2521,6 +2591,7 @@ class FlatDualSimulator:
                 "fill_type": fill_type,
                 "entry_up": trade.entry_up if trade.up_filled else "",
                 "entry_down": trade.entry_down if trade.down_filled else "",
+                **self._one_side_fields(trade, gap_fields),
                 "outcome": outcome,
                 "pnl": round(pnl, 2),
                 "capital_after": round(equity_after, 2),

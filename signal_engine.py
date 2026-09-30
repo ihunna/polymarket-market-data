@@ -638,16 +638,20 @@ class RegimeEngine:
         offset = self.anchor_hour_utc * 3600
         return int(ts - ((ts - offset) % 86400))
 
-    def daily_open(self, now: float | None = None) -> float | None:
-        # A window's open is the previous window's close, so the anchor's open is the
-        # close of the window that ended at the anchor.
-        target = self.daily_anchor(now) - self.duration_seconds
+    def close_of(self, window_start: int) -> float | None:
         for ws, price in zip(reversed(self.window_starts), reversed(self.prices)):
-            if ws == target:
+            if ws == window_start:
                 return price
-            if ws < target:
+            if ws < window_start:
                 break
         return None
+
+    def open_of(self, window_start: int) -> float | None:
+        # A window's open is the previous window's close.
+        return self.close_of(window_start - self.duration_seconds)
+
+    def daily_open(self, now: float | None = None) -> float | None:
+        return self.open_of(self.daily_anchor(now))
 
     def get_state(self, current_price: float | None = None, now: float | None = None) -> RegimeState:
         mode = self.mode
@@ -2145,6 +2149,8 @@ class FlatDualSimulator:
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
         self.cancel_move = float(cfg.get("cancel_move", 0))
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
+        self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
+        self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2174,6 +2180,7 @@ class FlatDualSimulator:
         self._ask_lows: dict[int, dict[str, tuple[float, float]]] = {}
         self._ask_lows_after: dict[int, dict[str, tuple[float, float]]] = {}
         self._interval_lows: dict[int, dict[str, float]] = {}
+        self._opens: dict[int, float] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
@@ -2234,6 +2241,24 @@ class FlatDualSimulator:
             "trend_move": round(state.move_amount, 2),
             "trend_bias": state.bias,
         }
+
+    def _window_open(self, window_start: int) -> float | None:
+        if window_start in self._opens:
+            return self._opens[window_start]
+        return self.regime.open_of(window_start) if self.regime is not None else None
+
+    def _trend_skip_reason(self, window_start: int, current_price: float) -> str:
+        """Skip reason when price has run too far from the open 1 or 3 windows back; "" to trade."""
+        moves = []
+        for windows_back, limit in ((1, self.trend_skip_one_window), (3, self.trend_skip_three_windows)):
+            if limit <= 0:
+                continue
+            ref = self._window_open(window_start - windows_back * self.duration_seconds)
+            if ref is not None and ref > 0:
+                moves.append((windows_back, current_price - ref, limit))
+        if not any(abs(move) >= limit for _, move, limit in moves):
+            return ""
+        return "trend " + " ".join(f"{n}w={move:+.2f}" for n, move, _ in moves)
 
     def _log_skip(
         self,
@@ -2321,6 +2346,13 @@ class FlatDualSimulator:
                 up_ask,
                 down_ask,
                 f"moved gap={gap:+.2f}{binance_bit}",
+            )
+            return
+
+        trend_reason = self._trend_skip_reason(window_start, current_price)
+        if trend_reason:
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask, trend_reason
             )
             return
 
@@ -2617,6 +2649,8 @@ class FlatDualSimulator:
         self._binance_price = binance_price
         self._binance_price_to_beat = binance_price_to_beat
         self._first_seen.setdefault(window_start, remaining_seconds)
+        if price_to_beat > 0:
+            self._opens[window_start] = price_to_beat
         self._track_gap(window_start, price_to_beat, current_price)
         self._track_flips(window_start, price_to_beat, current_price, remaining_seconds)
         self._track_asks(window_start, up_ask, down_ask, remaining_seconds)
@@ -2650,6 +2684,8 @@ class FlatDualSimulator:
         self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}
         self._ask_lows_after = {w: v for w, v in self._ask_lows_after.items() if w > window_start}
         self._interval_lows = {w: v for w, v in self._interval_lows.items() if w > window_start}
+        keep_from = window_start - 4 * self.duration_seconds
+        self._opens = {w: v for w, v in self._opens.items() if w >= keep_from}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)

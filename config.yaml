@@ -77,7 +77,7 @@ strategies:
     flip_margin: 0.02              # log-only: the gap must cross to beyond ±this for a flip to count
     trend_skip_one_window: 0.50    # skip if price at the decision is this far from the previous window's open; 0 = off
     trend_skip_three_windows: 0    # skip if price at the decision is this far from the open 3 windows back; 0 = off
-    min_trades_before_decision: 12   # skip if fewer than this many trades in the window before the decision; 0 = off
+    min_trades_before_decision: 16   # skip if fewer than this many trades in the window before the decision; 0 = off
     decision_tolerance_seconds: 60 # give up if no price/asks within this long after the decision point
     cancel_remaining_seconds: 0    # cancel unfilled limits with this many seconds left; 0 = never
     cancel_move: 0                 # after entry, if no side has filled, cancel both limits once the PM or Binance gap exceeds this; 0 = never

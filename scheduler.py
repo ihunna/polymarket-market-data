@@ -11,10 +11,7 @@ from collections import deque
 from datetime import datetime
 import zoneinfo
 import websocket
-from polymarket_poller import (
-    fetch_polymarket_data,
-    get_market_metadata_for_slug,
-)
+from polymarket_poller import get_market_metadata_for_slug
 from signal_engine import StrategyRunner, load_config, apply_duration_paths
 
 # Some cloud hosts stall on IPv6 connects; resolve IPv4 only for this process.
@@ -44,11 +41,11 @@ ws_state = {
     "connected": False
 }
 
-def get_current_active_slug(coin="sol"):
+def get_current_active_slug(coin="sol", at=None):
     """Computes the exact slug for short-duration or hourly markets matching Polymarket's URL scheme."""
     if DURATION_MINUTES == 60:
         et_zone = zoneinfo.ZoneInfo("America/New_York")
-        now_et = datetime.now(et_zone)
+        now_et = datetime.now(et_zone) if at is None else datetime.fromtimestamp(at, et_zone)
         
         month_name = now_et.strftime("%B").lower()
         day = now_et.strftime("%d").lstrip("0")
@@ -60,7 +57,7 @@ def get_current_active_slug(coin="sol"):
         full_coin_name = "solana" if coin == "sol" else coin
         return f"{full_coin_name}-up-or-down-{month_name}-{day}-{year}-{hour_12}{ampm}-et"
     
-    now_utc = calendar.timegm(time.gmtime())
+    now_utc = calendar.timegm(time.gmtime()) if at is None else int(at)
     window_start = (now_utc // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
     return f"{coin}-updown-{DURATION_MINUTES}m-{window_start}"
 
@@ -139,35 +136,76 @@ def log_to_csv(timestamp, price_to_beat, final_price, lowest_up, lowest_down, ou
 
 # --- Single Global Permanent WebSocket Manager for Order Book Asks Only ---
 ORDER_BOOK_STALE_SECONDS = 10
-ORDER_BOOK_CONNECT_TIMEOUT_SECONDS = 60
+ORDER_BOOK_CONNECT_TIMEOUT_SECONDS = 15
+NEXT_WINDOW_SUBSCRIBE_SECONDS = 60
 
 
 class PersistentPolymarketWS:
     def __init__(self):
         self.ws = None
         self.active_tokens = []
+        self.next_tokens = []
         self.is_running = True
         self.lock = threading.Lock()
         self.last_update = time.time()
         self.connected = False
         self.ever_connected = False
         self.disconnected_at = time.time()
+        self.subscribed = False
+        self.books = {}
+        self.volume = {}
+        self.trades_from = {}
+        self.tracked_since = {}
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
         threading.Thread(target=self._watchdog_loop, daemon=True).start()
 
-    def update_tokens(self, token_ids):
-        """Switch markets on a fresh connection so no old subscriptions linger."""
+    def _watched(self):
+        return list(self.active_tokens) + [t for t in self.next_tokens if t not in self.active_tokens]
+
+    def _best_ask(self, token):
+        asks = self.books.get(token, {}).get("asks")
+        return min(asks) if asks else 0.0
+
+    def prepare_next(self, token_ids, window_start):
+        """Subscribe the next window's tokens ahead of the switch so its book is ready at the start."""
         with self.lock:
-            had_tokens = bool(self.active_tokens)
-            self.active_tokens = token_ids
-            if not had_tokens:
-                # Nothing to replace: subscribe on the live connection, or let _on_open do it.
-                if self.connected and self.ws is not None:
-                    self.last_update = time.time()
-                    self._send_subscription(self.ws, token_ids)
+            if not token_ids or token_ids in (self.next_tokens, self.active_tokens):
                 return
-        self._reconnect()
+            self.next_tokens = token_ids
+            for t in token_ids:
+                self.trades_from[t] = window_start
+                self.tracked_since[t] = time.time()
+            if self.connected and self.ws is not None:
+                self._send_subscription(self.ws, token_ids)
+
+    def update_tokens(self, token_ids, window_start):
+        """Make token_ids the current window's tokens on the open connection, without reconnecting."""
+        with self.lock:
+            if token_ids == self.active_tokens:
+                return
+            prepared = token_ids == self.next_tokens
+            old = [t for t in self.active_tokens if t not in token_ids]
+            self.active_tokens = token_ids
+            self.next_tokens = []
+            if not prepared:
+                for t in token_ids:
+                    self.trades_from[t] = window_start
+                    self.tracked_since[t] = time.time()
+            for t in old:
+                for store in (self.books, self.volume, self.trades_from, self.tracked_since):
+                    store.pop(t, None)
+            ws_state["up_raw"] = self._best_ask(token_ids[0])
+            ws_state["down_raw"] = self._best_ask(token_ids[1])
+            if self.connected and self.ws is not None:
+                self.last_update = time.time()
+                if not prepared:
+                    self._send_subscription(self.ws, token_ids)
+                if old:
+                    try:
+                        self.ws.send(json.dumps({"assets_ids": old, "operation": "unsubscribe"}))
+                    except Exception:
+                        pass
 
     def _mark_disconnected(self):
         with self.lock:
@@ -212,12 +250,14 @@ class PersistentPolymarketWS:
                         pass
 
     def _send_subscription(self, ws, token_ids):
+        """Call with the lock held. The first message on a connection sets it up; later ones add tokens."""
         try:
-            payload = {
-                "assets_ids": token_ids,
-                "type": "market"
-            }
+            if self.subscribed:
+                payload = {"assets_ids": token_ids, "operation": "subscribe"}
+            else:
+                payload = {"assets_ids": token_ids, "type": "market"}
             ws.send(json.dumps(payload))
+            self.subscribed = True
         except Exception:
             pass
 
@@ -241,9 +281,15 @@ class PersistentPolymarketWS:
                 if asset_ids & {up_t, down_t} - {None}:
                     with self.lock:
                         self.last_update = time.time()
-                if item.get("event_type") == "price_change":
+                event = item.get("event_type")
+                if event == "book":
+                    self._replace_book(item)
+                elif event == "last_trade_price":
+                    self._add_trade(item)
+                elif event == "price_change":
                     for change in item.get("price_changes", []):
                         asset_id = change.get("asset_id")
+                        self._apply_level(change)
                         best_ask_str = change.get("best_ask")
                         if asset_id and best_ask_str:
                             val = float(best_ask_str)
@@ -253,6 +299,69 @@ class PersistentPolymarketWS:
                                 ws_state["down_raw"] = val
         except Exception:
             pass
+
+    def _replace_book(self, item):
+        asset_id = item.get("asset_id")
+        with self.lock:
+            if asset_id not in self._watched():
+                return
+            self.books[asset_id] = {
+                side: {float(lvl["price"]): float(lvl["size"]) for lvl in item.get(key, [])}
+                for side, key in (("bids", "bids"), ("asks", "asks"))
+            }
+            if asset_id in self.active_tokens[:2]:
+                key = "up_raw" if asset_id == self.active_tokens[0] else "down_raw"
+                ws_state[key] = self._best_ask(asset_id)
+
+    def _apply_level(self, change):
+        asset_id = change.get("asset_id")
+        side = "bids" if change.get("side") == "BUY" else "asks"
+        with self.lock:
+            book = self.books.get(asset_id)
+            if book is None or change.get("price") is None:
+                return
+            price, size = float(change["price"]), float(change.get("size") or 0)
+            if size > 0:
+                book[side][price] = size
+            else:
+                book[side].pop(price, None)
+
+    def _add_trade(self, item):
+        asset_id = item.get("asset_id")
+        with self.lock:
+            if asset_id not in self._watched():
+                return
+            if float(item.get("timestamp") or 0) / 1000 < self.trades_from.get(asset_id, 0):
+                return
+            usd, count = self.volume.get(asset_id, (0.0, 0))
+            self.volume[asset_id] = (usd + float(item["price"]) * float(item["size"]), count + 1)
+
+    def volume_totals(self):
+        """(dollars traded, trade count, time since when trades have been seen without a gap)."""
+        with self.lock:
+            usd = sum(self.volume.get(t, (0.0, 0))[0] for t in self.active_tokens)
+            count = sum(self.volume.get(t, (0.0, 0))[1] for t in self.active_tokens)
+            since = max((self.tracked_since.get(t, time.time()) for t in self.active_tokens), default=time.time())
+            return usd, count, since
+
+    def depth_snapshot(self, within=0.05):
+        """Best bid/ask sizes and shares within `within` of the best price, for Up and Down."""
+        out = {}
+        with self.lock:
+            for name, token in zip(("up", "down"), self.active_tokens):
+                book = self.books.get(token)
+                if not book:
+                    continue
+                bids, asks = book["bids"], book["asks"]
+                if bids:
+                    best = max(bids)
+                    out[f"{name}_bid_size"] = bids[best]
+                    out[f"{name}_bid_depth_5c"] = sum(s for p, s in bids.items() if p >= best - within - 1e-9)
+                if asks:
+                    best = min(asks)
+                    out[f"{name}_ask_size"] = asks[best]
+                    out[f"{name}_ask_depth_5c"] = sum(s for p, s in asks.items() if p <= best + within + 1e-9)
+        return out
 
     def _on_open(self, ws):
         ws_state["connected"] = True
@@ -264,8 +373,13 @@ class PersistentPolymarketWS:
             self.ever_connected = True
             self.disconnected_at = None
             self.last_update = now
-            if self.active_tokens:
-                self._send_subscription(ws, self.active_tokens)
+            self.subscribed = False
+            watched = self._watched()
+            if watched:
+                # Trades sent while disconnected are lost, so coverage restarts now.
+                for t in watched:
+                    self.tracked_since[t] = now
+                self._send_subscription(ws, watched)
         sys.stdout.write(f"\n🔌 Order book {verb} in {took:.1f}s\n")
         sys.stdout.flush()
 
@@ -527,6 +641,15 @@ class PersistentPriceWS:
                 time.sleep(2)
 
 
+def prepare_next_window(ws_manager, next_start):
+    try:
+        up_token, down_token, _ = get_market_metadata_for_slug(get_current_active_slug(coin="sol", at=next_start))
+        if up_token and down_token:
+            ws_manager.prepare_next([up_token, down_token], next_start)
+    except Exception:
+        pass
+
+
 def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None):
     """Executes a window loop tracking token asks and syncing window boundary to ET/UTC epoch."""
     now_utc = calendar.timegm(time.gmtime())
@@ -550,15 +673,10 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
         time.sleep(2)
         return price_to_beat
 
-    # Point global socket to this window's tokens
-    ws_manager.update_tokens([up_token, down_token])
+    # Point the socket at this window's tokens; asks come from the book it already holds or receives next.
+    ws_manager.update_tokens([up_token, down_token], window_start)
+    next_prepared = False
 
-    # Seed initial REST fallback values for token asks
-    initial_data = fetch_polymarket_data(active_slug)
-    if initial_data.get("status") == "success":
-        ws_state["up_raw"] = initial_data.get("up_raw", 0.0)
-        ws_state["down_raw"] = initial_data.get("down_raw", 0.0)
-    
     lowest_up_seen = float('inf')
     lowest_down_seen = float('inf')
     initialized = False
@@ -570,6 +688,10 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
         remaining = window_end - current_time
         if remaining < 0:
             remaining = 0
+
+        if not next_prepared and remaining <= NEXT_WINDOW_SUBSCRIBE_SECONDS:
+            next_prepared = True
+            threading.Thread(target=prepare_next_window, args=(ws_manager, window_end), daemon=True).start()
         
         if current_time >= window_end:
             print("\n⏳ Window ended. Reading end price from the price socket...")
@@ -632,6 +754,7 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
         binance_price = price_ws.latest_binance()
         gap_ptb = price_ws.price_at(window_start) or price_to_beat
         binance_ptb = price_ws.binance_at(window_start)
+        volume_usd, trade_count, volume_since = ws_manager.volume_totals()
 
         if simulator is not None:
             simulator.on_window_update(
@@ -646,6 +769,10 @@ def run_high_frequency_loop(ws_manager, price_ws, price_to_beat, simulator=None)
                 inferred_outcome=None,
                 binance_price=binance_price,
                 binance_price_to_beat=binance_ptb,
+                volume_usd=volume_usd,
+                trade_count=trade_count,
+                volume_since=volume_since,
+                book_depth=ws_manager.depth_snapshot,
             )
 
         up_cents = format_token_cents(up_cost)

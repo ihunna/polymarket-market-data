@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -101,6 +101,19 @@ FLAT_DUAL_TRADES_HEADER = [
     "trend_open",
     "trend_move",
     "trend_bias",
+    "volume_before_usd",
+    "trades_before",
+    "volume_after_usd",
+    "trades_after",
+    "volume_partial",
+    "up_bid_size",
+    "up_ask_size",
+    "up_bid_depth_5c",
+    "up_ask_depth_5c",
+    "down_bid_size",
+    "down_ask_size",
+    "down_bid_depth_5c",
+    "down_ask_depth_5c",
     "max_move",
     "limit_cents",
     "up_ask_at_entry",
@@ -2151,6 +2164,7 @@ class FlatDualSimulator:
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
+        self.min_trades_before_decision = int(cfg.get("min_trades_before_decision", 0))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2181,6 +2195,8 @@ class FlatDualSimulator:
         self._ask_lows_after: dict[int, dict[str, tuple[float, float]]] = {}
         self._interval_lows: dict[int, dict[str, float]] = {}
         self._opens: dict[int, float] = {}
+        self._volume: dict[int, tuple[float, int, bool]] = {}
+        self._decision_market: dict[int, dict[str, Any]] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
@@ -2353,6 +2369,20 @@ class FlatDualSimulator:
         if trend_reason:
             self._log_skip(
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask, trend_reason
+            )
+            return
+
+        market = self._decision_market.get(window_start, {})
+        trades = market.get("trades_before")
+        if (
+            self.min_trades_before_decision > 0
+            and trades is not None
+            and not market.get("volume_partial")
+            and trades < self.min_trades_before_decision
+        ):
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask,
+                f"low_volume trades={trades} ${market.get('volume_before_usd', 0):.2f}",
             )
             return
 
@@ -2632,7 +2662,33 @@ class FlatDualSimulator:
                 _format_mmss(flips["last_after"]) if "last_after" in flips else ""
             ),
             "final_gap": round(final_gap, 2) if final_gap is not None else "",
+            **self._market_fields(window_start),
         }
+
+    def _record_decision_market(
+        self, window_start: int, remaining: float, book_depth: Callable[[], dict[str, float]] | None
+    ) -> None:
+        if window_start in self._decision_market or remaining > self.decision_remaining_seconds:
+            return
+        snapshot: dict[str, Any] = {}
+        if window_start in self._volume:
+            usd, count, partial = self._volume[window_start]
+            snapshot.update(volume_before_usd=usd, trades_before=count, volume_partial=partial)
+        if book_depth is not None:
+            snapshot.update({k: round(v, 2) for k, v in book_depth().items()})
+        self._decision_market[window_start] = snapshot
+
+    def _market_fields(self, window_start: int) -> dict[str, Any]:
+        fields = dict(self._decision_market.get(window_start, {}))
+        if "volume_before_usd" in fields:
+            before_usd, before_count = fields["volume_before_usd"], fields["trades_before"]
+            fields["volume_before_usd"] = round(before_usd, 2)
+            fields["volume_partial"] = 1 if fields["volume_partial"] else ""
+            if window_start in self._volume:
+                usd, count, _ = self._volume[window_start]
+                fields["volume_after_usd"] = round(usd - before_usd, 2)
+                fields["trades_after"] = count - before_count
+        return fields
 
     def on_window_update(
         self,
@@ -2644,6 +2700,10 @@ class FlatDualSimulator:
         down_ask: float,
         binance_price: float = 0.0,
         binance_price_to_beat: float = 0.0,
+        volume_usd: float | None = None,
+        trade_count: int = 0,
+        volume_since: float | None = None,
+        book_depth: Callable[[], dict[str, float]] | None = None,
         **_: Any,
     ) -> None:
         self._binance_price = binance_price
@@ -2651,6 +2711,11 @@ class FlatDualSimulator:
         self._first_seen.setdefault(window_start, remaining_seconds)
         if price_to_beat > 0:
             self._opens[window_start] = price_to_beat
+        if volume_usd is not None:
+            # Trades are only counted from subscription, so a late start undercounts the window.
+            partial = volume_since is None or volume_since > window_start + 30
+            self._volume[window_start] = (volume_usd, trade_count, partial)
+        self._record_decision_market(window_start, remaining_seconds, book_depth)
         self._track_gap(window_start, price_to_beat, current_price)
         self._track_flips(window_start, price_to_beat, current_price, remaining_seconds)
         self._track_asks(window_start, up_ask, down_ask, remaining_seconds)
@@ -2686,6 +2751,8 @@ class FlatDualSimulator:
         self._interval_lows = {w: v for w, v in self._interval_lows.items() if w > window_start}
         keep_from = window_start - 4 * self.duration_seconds
         self._opens = {w: v for w, v in self._opens.items() if w >= keep_from}
+        self._volume = {w: v for w, v in self._volume.items() if w > window_start}
+        self._decision_market = {w: v for w, v in self._decision_market.items() if w > window_start}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)

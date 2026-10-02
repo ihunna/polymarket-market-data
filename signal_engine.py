@@ -148,6 +148,9 @@ FLAT_DUAL_TRADES_HEADER = [
     "one_side_max_bid_time_left",
     "one_side_bid_at_end",
     "one_side_paired_time_left",
+    "sold_side",
+    "sold_price",
+    "sold_time_left",
     "outcome",
     "pnl",
     "capital_after",
@@ -2159,6 +2162,10 @@ class FlatDualOpenTrade:
     one_side_max_bid: float = 0.0
     one_side_max_bid_left: float | None = None
     one_side_paired_left: float | None = None
+    sold_side: str = ""
+    sold_price: float = 0.0
+    sold_fee: float = 0.0
+    sold_left: float | None = None
     trend: dict[str, Any] | None = None
     notes: str = ""
 
@@ -2192,6 +2199,8 @@ class FlatDualSimulator:
         self.decision_tolerance_seconds = float(cfg.get("decision_tolerance_seconds", 60))
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
         self.cancel_move = float(cfg.get("cancel_move", 0))
+        self.stop_sell_price = float(cfg.get("stop_sell_cents", 0)) / 100.0
+        self.taker_fee_rate = float(cfg.get("taker_fee_rate", 0.07))
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
@@ -2272,7 +2281,9 @@ class FlatDualSimulator:
                 ("Up", trade.up_filled, trade.up_resting, trade.up_cancelled),
                 ("Down", trade.down_filled, trade.down_resting, trade.down_cancelled),
             ):
-                if filled:
+                if trade.sold_side == side:
+                    legs.append(f"{side} sold@{trade.sold_price*100:.0f}¢")
+                elif filled:
                     legs.append(f"{side}✓")
                 elif resting:
                     legs.append(f"{side}@{self.limit_cents}¢")
@@ -2563,6 +2574,8 @@ class FlatDualSimulator:
                 trade.up_resting = trade.down_resting = False
                 trade.notes = ";".join(n for n in (trade.notes, "resting_cancelled") if n)
             return
+        if trade.sold_side:
+            return
         # Checked before fills so a big move cancels the limit before its ask crosses it.
         if self._cancel_on_move(trade, remaining, price_to_beat, current_price):
             return
@@ -2571,6 +2584,31 @@ class FlatDualSimulator:
         if trade.down_resting and 0.0 < down_ask <= self.limit_price:
             self._fill(trade, "Down", self.limit_price)
         self._track_one_side(trade, remaining, up_ask, down_ask)
+        self._stop_sell(trade, remaining, up_ask, down_ask)
+
+    def _stop_sell(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
+        """With exactly one side held, sell it at its bid once the bid is at or below the stop; cancel the other limit."""
+        if self.stop_sell_price <= 0 or trade.up_filled == trade.down_filled:
+            return
+        side = "Up" if trade.up_filled else "Down"
+        # In a two-outcome market the bid for one side is 1 minus the other side's ask.
+        other_ask = down_ask if side == "Up" else up_ask
+        if not 0.0 < other_ask < 1.0:
+            return
+        bid = round(1.0 - other_ask, 2)
+        if bid > self.stop_sell_price:
+            return
+        trade.sold_side, trade.sold_price, trade.sold_left = side, bid, remaining
+        trade.sold_fee = self.taker_fee_rate * bid * (1.0 - bid)
+        trade.up_cancelled = trade.up_cancelled or trade.up_resting
+        trade.down_cancelled = trade.down_cancelled or trade.down_resting
+        trade.up_resting = trade.down_resting = False
+        entry = trade.entry_up if side == "Up" else trade.entry_down
+        locked = trade.contracts * (bid - trade.sold_fee - (entry or 0.0))
+        self._print_event(
+            f"🔻 [flat_dual] stop sold {side} @ {bid*100:.0f}¢ | pnl locked {locked:+.2f} | "
+            f"{_format_mmss(remaining)} left | {trade.slug}"
+        )
 
     def _track_one_side(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
         """Log-only: while exactly one side is held, the best price it could have been sold for."""
@@ -2863,7 +2901,11 @@ class FlatDualSimulator:
 
         pnl = 0.0
         notes = [n for n in (trade.notes,) if n]
-        if outcome in ("Up", "Down"):
+        if trade.sold_side:
+            entry = trade.entry_up if trade.sold_side == "Up" else trade.entry_down
+            pnl = trade.contracts * (trade.sold_price - trade.sold_fee - (entry or 0.0))
+            notes.append(f"stop_sold_{trade.sold_side.lower()}")
+        elif outcome in ("Up", "Down"):
             if trade.up_filled:
                 pnl += trade.contracts * ((1.0 if outcome == "Up" else 0.0) - trade.entry_up)
             if trade.down_filled:
@@ -2900,6 +2942,9 @@ class FlatDualSimulator:
                 "entry_up": trade.entry_up if trade.up_filled else "",
                 "entry_down": trade.entry_down if trade.down_filled else "",
                 **self._one_side_fields(trade, gap_fields),
+                "sold_side": trade.sold_side,
+                "sold_price": trade.sold_price if trade.sold_side else "",
+                "sold_time_left": _format_mmss(trade.sold_left) if trade.sold_left is not None else "",
                 "outcome": outcome,
                 "pnl": round(pnl, 2),
                 "capital_after": round(equity_after, 2),

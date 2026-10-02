@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import sys
 import time
+import zoneinfo
 from dataclasses import dataclass
+from datetime import datetime
+from statistics import NormalDist
 from typing import Any, Callable
 
 import yaml
@@ -114,6 +118,11 @@ FLAT_DUAL_TRADES_HEADER = [
     "down_ask_size",
     "down_bid_depth_5c",
     "down_ask_depth_5c",
+    "price_vol_before",
+    "binance_vol_before",
+    "last_min_move",
+    "implied_vol",
+    "vol_ratio",
     "max_move",
     "limit_cents",
     "up_ask_at_entry",
@@ -319,6 +328,28 @@ def _parse_price(value: Any) -> float:
 def _format_mmss(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+NEW_YORK = zoneinfo.ZoneInfo("America/New_York")
+
+
+def _parse_clock_range(value: Any) -> tuple[int, int] | None:
+    """'16:00-20:00' -> (960, 1200) minutes after midnight; empty/None -> None."""
+    if not value:
+        return None
+    minutes = []
+    for part in str(value).split("-"):
+        hours, mins = part.strip().split(":")
+        minutes.append(int(hours) * 60 + int(mins))
+    start, end = minutes
+    return start, end
+
+
+def _stdev(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / (len(values) - 1))
 
 
 def _coin_slug_prefix(coin: str) -> str:
@@ -2165,6 +2196,7 @@ class FlatDualSimulator:
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
         self.min_trades_before_decision = int(cfg.get("min_trades_before_decision", 0))
+        self.skip_new_york_hours = _parse_clock_range(cfg.get("skip_new_york_hours"))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2197,6 +2229,7 @@ class FlatDualSimulator:
         self._opens: dict[int, float] = {}
         self._volume: dict[int, tuple[float, int, bool]] = {}
         self._decision_market: dict[int, dict[str, Any]] = {}
+        self._volatility: dict[int, dict[str, Any]] = {}
         self._last_asks: dict[int, tuple[float, float]] = {}
         self._pending_skips: dict[int, dict[str, Any]] = {}
         self._binance_price = 0.0
@@ -2276,6 +2309,54 @@ class FlatDualSimulator:
             return ""
         return "trend " + " ".join(f"{n}w={move:+.2f}" for n, move, _ in moves)
 
+    def _new_york_hours_skip_reason(self, window_start: int) -> str:
+        """Skip reason when the decision point falls in the configured New York clock range; "" to trade."""
+        if self.skip_new_york_hours is None:
+            return ""
+        decision_at = window_start + self.duration_seconds - self.decision_remaining_seconds
+        ny = datetime.fromtimestamp(decision_at, NEW_YORK)
+        minute = ny.hour * 60 + ny.minute
+        start, end = self.skip_new_york_hours
+        inside = start <= minute < end if start <= end else (minute >= start or minute < end)
+        return f"us_after_hours ny={ny:%H:%M}" if inside else ""
+
+    def _record_volatility(
+        self, window_start: int, gap: float, remaining: float, up_ask: float, down_ask: float
+    ) -> None:
+        """Log-only: how much the price moved per minute before the decision vs what the asks imply."""
+        early = self._early.get(window_start, {})
+        checks = [
+            i for i, r in enumerate(self.early_check_remaining, start=1)
+            if r >= self.decision_remaining_seconds and early.get(f"early{i}_time_left")
+        ]
+        start = self._gaps.get(window_start, {}).get("start")
+        gaps = ([start] if start is not None else []) + [early.get(f"early{i}_gap") for i in checks]
+        gaps = [g for g in gaps if isinstance(g, (int, float))]
+        bgaps = [early.get(f"early{i}_binance_gap") for i in checks]
+        bgaps = [g for g in bgaps if isinstance(g, (int, float))]
+        steps = [b - a for a, b in zip(gaps, gaps[1:])]
+        price_vol = _stdev(steps)
+        binance_vol = _stdev([b - a for a, b in zip(bgaps, bgaps[1:])])
+
+        # Movement per sqrt(minute) the asks imply: Up mid = P(Up) = Phi(gap / (vol * sqrt(minutes left))).
+        # Too noisy to solve when the gap or the mid is near zero / 50c.
+        up_mid = (up_ask + (1.0 - down_ask)) / 2.0
+        implied = None
+        if abs(gap) >= 0.03 and abs(up_mid - 0.5) >= 0.03 and remaining > 0:
+            z = abs(NormalDist().inv_cdf(min(max(up_mid, 0.02), 0.98)))
+            implied = abs(gap) / (z * math.sqrt(remaining / 60.0))
+
+        def r(v: float | None, digits: int = 3) -> float | str:
+            return round(v, digits) if v is not None else ""
+
+        self._volatility[window_start] = {
+            "price_vol_before": r(price_vol),
+            "binance_vol_before": r(binance_vol),
+            "last_min_move": r(abs(steps[-1]) if steps else None),
+            "implied_vol": r(implied),
+            "vol_ratio": r(price_vol / implied if price_vol is not None and implied else None, 2),
+        }
+
     def _log_skip(
         self,
         window_start: int,
@@ -2350,6 +2431,7 @@ class FlatDualSimulator:
 
         self._decided_windows.add(window_start)
         gap = round(current_price - price_to_beat, 2)
+        self._record_volatility(window_start, current_price - price_to_beat, remaining, up_ask, down_ask)
         binance_gap = self._binance_gap_value()
         binance_moved = binance_gap is not None and abs(binance_gap) > self.max_binance_move
         if abs(gap) > self.max_move or binance_moved:
@@ -2369,6 +2451,13 @@ class FlatDualSimulator:
         if trend_reason:
             self._log_skip(
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask, trend_reason
+            )
+            return
+
+        hours_reason = self._new_york_hours_skip_reason(window_start)
+        if hours_reason:
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask, hours_reason
             )
             return
 
@@ -2663,6 +2752,7 @@ class FlatDualSimulator:
             ),
             "final_gap": round(final_gap, 2) if final_gap is not None else "",
             **self._market_fields(window_start),
+            **self._volatility.get(window_start, {}),
         }
 
     def _record_decision_market(
@@ -2753,6 +2843,7 @@ class FlatDualSimulator:
         self._opens = {w: v for w, v in self._opens.items() if w >= keep_from}
         self._volume = {w: v for w, v in self._volume.items() if w > window_start}
         self._decision_market = {w: v for w, v in self._decision_market.items() if w > window_start}
+        self._volatility = {w: v for w, v in self._volatility.items() if w > window_start}
         self._last_asks = {w: v for w, v in self._last_asks.items() if w > window_start}
         if skip_row is not None:
             skip_row.update(gap_fields)

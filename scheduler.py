@@ -845,6 +845,13 @@ def parse_args():
         help="Restore opposite_side starting equity (overrides strategies.opposite_side.capital).",
     )
     parser.add_argument(
+        "--fd-last",
+        type=float,
+        default=None,
+        metavar="EQUITY",
+        help="Restore flat_dual starting equity (overrides strategies.flat_dual.capital).",
+    )
+    parser.add_argument(
         "--ref-price",
         type=float,
         default=None,
@@ -861,28 +868,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def apply_capital_overrides(config: dict, dh_last: float | None, opp_last: float | None) -> list[str]:
+def apply_capital_overrides(
+    config: dict, dh_last: float | None, opp_last: float | None, fd_last: float | None = None
+) -> list[str]:
     """Apply CLI capital restores onto strategy configs. Returns human-readable notes."""
     notes: list[str] = []
     strategies = config.setdefault("strategies", {})
-    if dh_last is not None:
-        if dh_last <= 0:
-            raise SystemExit("--dh-last must be > 0")
-        dh = strategies.get("dual_hedge")
-        if not isinstance(dh, dict):
-            raise SystemExit("--dh-last provided but strategies.dual_hedge is missing")
-        prev = dh.get("capital")
-        dh["capital"] = float(dh_last)
-        notes.append(f"dual_hedge capital restored ${float(dh_last):.2f} (config was ${float(prev):.2f})")
-    if opp_last is not None:
-        if opp_last <= 0:
-            raise SystemExit("--opp-last must be > 0")
-        opp = strategies.get("opposite_side")
-        if not isinstance(opp, dict):
-            raise SystemExit("--opp-last provided but strategies.opposite_side is missing")
-        prev = opp.get("capital")
-        opp["capital"] = float(opp_last)
-        notes.append(f"opposite_side capital restored ${float(opp_last):.2f} (config was ${float(prev):.2f})")
+    for flag, name, last in (
+        ("--dh-last", "dual_hedge", dh_last),
+        ("--opp-last", "opposite_side", opp_last),
+        ("--fd-last", "flat_dual", fd_last),
+    ):
+        if last is None:
+            continue
+        if last <= 0:
+            raise SystemExit(f"{flag} must be > 0")
+        strategy = strategies.get(name)
+        if not isinstance(strategy, dict):
+            raise SystemExit(f"{flag} provided but strategies.{name} is missing")
+        prev = strategy.get("capital")
+        strategy["capital"] = float(last)
+        notes.append(f"{name} capital restored ${float(last):.2f} (config was ${float(prev):.2f})")
     return notes
 
 
@@ -928,7 +934,7 @@ if __name__ == "__main__":
     DURATION_MINUTES = resolve_duration(args.duration, APP_CONFIG.get("duration_minutes"))
     WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
     APP_CONFIG = apply_duration_paths(APP_CONFIG, COIN_NAME, DURATION_MINUTES)
-    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last)
+    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last, args.fd_last)
     bias_notes = apply_bias_overrides(APP_CONFIG, args.ref_price, args.bias_mode)
 
     SIMULATOR = StrategyRunner.from_config(APP_CONFIG)

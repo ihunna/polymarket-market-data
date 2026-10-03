@@ -2166,6 +2166,7 @@ class FlatDualOpenTrade:
     sold_price: float = 0.0
     sold_fee: float = 0.0
     sold_left: float | None = None
+    stop_low_since: float | None = None
     trend: dict[str, Any] | None = None
     notes: str = ""
 
@@ -2200,6 +2201,8 @@ class FlatDualSimulator:
         self.cancel_remaining_seconds = float(cfg.get("cancel_remaining_seconds", 0))
         self.cancel_move = float(cfg.get("cancel_move", 0))
         self.stop_sell_price = float(cfg.get("stop_sell_cents", 0)) / 100.0
+        self.stop_sell_confirm_seconds = float(cfg.get("stop_sell_confirm_seconds", 0))
+        self.stop_sell_below_entry = float(cfg.get("stop_sell_below_entry_cents", 0)) / 100.0
         self.taker_fee_rate = float(cfg.get("taker_fee_rate", 0.07))
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
@@ -2587,23 +2590,29 @@ class FlatDualSimulator:
         self._stop_sell(trade, remaining, up_ask, down_ask)
 
     def _stop_sell(self, trade: FlatDualOpenTrade, remaining: float, up_ask: float, down_ask: float) -> None:
-        """With exactly one side held, sell it at its bid once the bid is at or below the stop; cancel the other limit."""
+        """With exactly one side held, sell it at its bid once the bid has stayed at or below the stop
+        (and enough below the entry) for the confirm time; cancel the other limit."""
         if self.stop_sell_price <= 0 or trade.up_filled == trade.down_filled:
             return
         side = "Up" if trade.up_filled else "Down"
+        entry = (trade.entry_up if side == "Up" else trade.entry_down) or 0.0
         # In a two-outcome market the bid for one side is 1 minus the other side's ask.
         other_ask = down_ask if side == "Up" else up_ask
         if not 0.0 < other_ask < 1.0:
             return
         bid = round(1.0 - other_ask, 2)
-        if bid > self.stop_sell_price:
+        if bid > self.stop_sell_price or bid > round(entry - self.stop_sell_below_entry, 2):
+            trade.stop_low_since = None
+            return
+        if trade.stop_low_since is None:
+            trade.stop_low_since = remaining
+        if trade.stop_low_since - remaining < self.stop_sell_confirm_seconds:
             return
         trade.sold_side, trade.sold_price, trade.sold_left = side, bid, remaining
         trade.sold_fee = self.taker_fee_rate * bid * (1.0 - bid)
         trade.up_cancelled = trade.up_cancelled or trade.up_resting
         trade.down_cancelled = trade.down_cancelled or trade.down_resting
         trade.up_resting = trade.down_resting = False
-        entry = trade.entry_up if side == "Up" else trade.entry_down
         locked = trade.contracts * (bid - trade.sold_fee - (entry or 0.0))
         self._print_event(
             f"🔻 [flat_dual] stop sold {side} @ {bid*100:.0f}¢ | pnl locked {locked:+.2f} | "

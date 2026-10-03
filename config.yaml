@@ -85,5 +85,6 @@ strategies:
     stop_sell_cents: 12            # with only one side filled, sell it once its bid is at or below this and cancel the other limit; 0 = never
     stop_sell_confirm_seconds: 60  # the bid must stay at or below the stop this long before selling (ignores brief dips); 0 = sell on first touch
     stop_sell_below_entry_cents: 5 # only sell if the bid is at least this far below what that side cost
-    taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on stop sells
+    taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on cheap buys at the ask and on stop sells
+    min_entry_ask_cents: 20        # skip the window if either side's ask is below this at the decision; 0 = off
     # trades → {coin}-{duration}-flat-dual-trades.csv

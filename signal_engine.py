@@ -2167,6 +2167,7 @@ class FlatDualOpenTrade:
     sold_fee: float = 0.0
     sold_left: float | None = None
     stop_low_since: float | None = None
+    entry_fees: float = 0.0
     trend: dict[str, Any] | None = None
     notes: str = ""
 
@@ -2204,6 +2205,7 @@ class FlatDualSimulator:
         self.stop_sell_confirm_seconds = float(cfg.get("stop_sell_confirm_seconds", 0))
         self.stop_sell_below_entry = float(cfg.get("stop_sell_below_entry_cents", 0)) / 100.0
         self.taker_fee_rate = float(cfg.get("taker_fee_rate", 0.07))
+        self.min_entry_ask = float(cfg.get("min_entry_ask_cents", 0)) / 100.0
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
@@ -2475,6 +2477,13 @@ class FlatDualSimulator:
             )
             return
 
+        if min(up_ask, down_ask) < self.min_entry_ask:
+            self._log_skip(
+                window_start, remaining, price_to_beat, current_price, up_ask, down_ask,
+                f"too_cheap up={up_ask*100:.0f}c down={down_ask*100:.0f}c",
+            )
+            return
+
         market = self._decision_market.get(window_start, {})
         trades = market.get("trades_before")
         if (
@@ -2537,6 +2546,7 @@ class FlatDualSimulator:
         for side, ask in (("Up", up_ask), ("Down", down_ask)):
             if ask < self.limit_price:
                 self._fill(trade, side, ask)
+                trade.entry_fees += contracts * self.taker_fee_rate * ask * (1.0 - ask)
             else:
                 self._rest(trade, side)
         self._track_one_side(trade, remaining, up_ask, down_ask)
@@ -2613,7 +2623,7 @@ class FlatDualSimulator:
         trade.up_cancelled = trade.up_cancelled or trade.up_resting
         trade.down_cancelled = trade.down_cancelled or trade.down_resting
         trade.up_resting = trade.down_resting = False
-        locked = trade.contracts * (bid - trade.sold_fee - (entry or 0.0))
+        locked = trade.contracts * (bid - trade.sold_fee - entry) - trade.entry_fees
         self._print_event(
             f"🔻 [flat_dual] stop sold {side} @ {bid*100:.0f}¢ | pnl locked {locked:+.2f} | "
             f"{_format_mmss(remaining)} left | {trade.slug}"
@@ -2921,6 +2931,9 @@ class FlatDualSimulator:
                 pnl += trade.contracts * ((1.0 if outcome == "Down" else 0.0) - trade.entry_down)
         else:
             notes.append("outcome_unknown")
+        if trade.entry_fees:
+            pnl -= trade.entry_fees
+            notes.append(f"taker_fee={trade.entry_fees:.2f}")
 
         _, free_after, equity_after = self.capital.release(window_start, pnl)
         self._append_row(

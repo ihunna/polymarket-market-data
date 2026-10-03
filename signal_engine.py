@@ -2334,7 +2334,7 @@ class FlatDualSimulator:
         minute = ny.hour * 60 + ny.minute
         start, end = self.skip_new_york_hours
         inside = start <= minute < end if start <= end else (minute >= start or minute < end)
-        return f"us_after_hours ny={ny:%H:%M}" if inside else ""
+        return f"outside_us_hours ny={ny:%H:%M}" if inside else ""
 
     def _record_volatility(
         self, window_start: int, gap: float, remaining: float, up_ask: float, down_ask: float

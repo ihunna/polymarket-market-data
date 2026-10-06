@@ -2210,6 +2210,7 @@ class FlatDualSimulator:
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
         self.min_trades_before_decision = int(cfg.get("min_trades_before_decision", 0))
+        self.min_volume_before_decision = float(cfg.get("min_volume_before_decision_usd", 0))
         self.skip_new_york_hours = _parse_clock_range(cfg.get("skip_new_york_hours"))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
@@ -2486,11 +2487,10 @@ class FlatDualSimulator:
 
         market = self._decision_market.get(window_start, {})
         trades = market.get("trades_before")
-        if (
-            self.min_trades_before_decision > 0
-            and trades is not None
-            and not market.get("volume_partial")
-            and trades < self.min_trades_before_decision
+        volume_usd = market.get("volume_before_usd")
+        if not market.get("volume_partial") and (
+            (self.min_trades_before_decision > 0 and trades is not None and trades < self.min_trades_before_decision)
+            or (self.min_volume_before_decision > 0 and volume_usd is not None and volume_usd < self.min_volume_before_decision)
         ):
             self._log_skip(
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask,

@@ -78,6 +78,7 @@ strategies:
     trend_skip_one_window: 0.50    # skip if price at the decision is this far from the previous window's open; 0 = off
     trend_skip_three_windows: 0    # skip if price at the decision is this far from the open 3 windows back; 0 = off
     min_trades_before_decision: 0    # skip if fewer than this many trades in the window before the decision; 0 = off (still logged)
+    min_volume_before_decision_usd: 0   # skip if less than this many $ traded in the window before the decision; 0 = off (still logged)
     skip_new_york_hours: "12:00-05:00"  # skip if the decision point is in this New York clock range (trade 05:00-12:00 NY = 10am-5pm UTC+1), every day; "" = off
     decision_tolerance_seconds: 60 # give up if no price/asks within this long after the decision point
     cancel_remaining_seconds: 0    # cancel unfilled limits with this many seconds left; 0 = never

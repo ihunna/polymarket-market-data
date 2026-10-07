@@ -90,4 +90,7 @@ strategies:
     stop_sell_below_entry_cents: 5 # only sell if the bid is at least this far below what that side cost
     taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on cheap buys at the ask and on stop sells
     min_entry_ask_cents: 20        # skip the window if either side's ask is below this at the decision; 0 = off
-    # trades → {coin}-{duration}-flat-dual-trades.csv
+    delta_side_on_skip: true       # in trading hours, when the dual skips for moved / not_calm / trend / too_cheap, buy the side the PM delta points to at its ask and hold
+    delta_side_contracts: 8
+    delta_side_capital: 100.0      # separate running balance, carried over from the last row of its log on restart
+    # trades → {coin}-{duration}-flat-dual-trades.csv, delta-side trades → {coin}-{duration}-delta-side-trades.csv

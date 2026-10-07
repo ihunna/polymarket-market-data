@@ -75,8 +75,10 @@ strategies:
     # log-only: Up/Down prices and gaps at these shares of the window; every minute from 14:00 to 01:00 left on 15m
     early_check_fractions: [0.066667, 0.133333, 0.2, 0.266667, 0.333333, 0.4, 0.466667, 0.533333, 0.6, 0.666667, 0.733333, 0.8, 0.866667, 0.933333]
     flip_margin: 0.02              # log-only: the gap must cross to beyond ±this for a flip to count
-    trend_skip_one_window: 0.50    # skip if price at the decision is this far from the previous window's open; 0 = off
+    trend_skip_one_window: 0       # skip if price at the decision is this far from the previous window's open; 0 = off
     trend_skip_three_windows: 0    # skip if price at the decision is this far from the open 3 windows back; 0 = off
+    calm_skip_pct: 0.5             # skip unless price stayed within ±this % of the open N windows back during those N windows; 0 = off
+    calm_skip_windows: 3
     min_trades_before_decision: 0    # skip if fewer than this many trades in the window before the decision; 0 = off (still logged)
     min_volume_before_decision_usd: 0   # skip if less than this many $ traded in the window before the decision; 0 = off (still logged)
     skip_new_york_hours: "12:00-05:00"  # skip if the decision point is in this New York clock range (trade 05:00-12:00 NY = 10am-5pm UTC+1), every day; "" = off

@@ -2209,6 +2209,8 @@ class FlatDualSimulator:
         self.flip_margin = float(cfg.get("flip_margin", 0.02))
         self.trend_skip_one_window = float(cfg.get("trend_skip_one_window", 0))
         self.trend_skip_three_windows = float(cfg.get("trend_skip_three_windows", 0))
+        self.calm_skip_pct = float(cfg.get("calm_skip_pct", 0))
+        self.calm_skip_windows = int(cfg.get("calm_skip_windows", 3))
         self.min_trades_before_decision = int(cfg.get("min_trades_before_decision", 0))
         self.min_volume_before_decision = float(cfg.get("min_volume_before_decision_usd", 0))
         self.skip_new_york_hours = _parse_clock_range(cfg.get("skip_new_york_hours"))
@@ -2242,6 +2244,7 @@ class FlatDualSimulator:
         self._ask_lows_after: dict[int, dict[str, tuple[float, float]]] = {}
         self._interval_lows: dict[int, dict[str, float]] = {}
         self._opens: dict[int, float] = {}
+        self._ranges: dict[int, tuple[float, float, bool]] = {}
         self._volume: dict[int, tuple[float, int, bool]] = {}
         self._decision_market: dict[int, dict[str, Any]] = {}
         self._volatility: dict[int, dict[str, Any]] = {}
@@ -2325,6 +2328,42 @@ class FlatDualSimulator:
         if not any(abs(move) >= limit for _, move, limit in moves):
             return ""
         return "trend " + " ".join(f"{n}w={move:+.2f}" for n, move, _ in moves)
+
+    def _track_range(self, window_start: int, current_price: float, remaining: float) -> None:
+        if current_price <= 0:
+            return
+        if window_start not in self._ranges:
+            full = remaining >= self.duration_seconds - 30
+            self._ranges[window_start] = (current_price, current_price, full)
+            return
+        lo, hi, full = self._ranges[window_start]
+        self._ranges[window_start] = (min(lo, current_price), max(hi, current_price), full)
+
+    def _calm_skip_reason(self, window_start: int) -> str:
+        """Skip reason when price left +-calm_skip_pct% of the open N windows back during those N windows; "" to trade."""
+        if self.calm_skip_pct <= 0:
+            return ""
+        n = self.calm_skip_windows
+        starts = [window_start - k * self.duration_seconds for k in range(n, 0, -1)]
+        ref = self._window_open(starts[0])
+        if ref is None or ref <= 0:
+            return ""
+        # Live high/low where the whole window was watched; otherwise its open and close (after a restart).
+        prices = [ref]
+        for i, ws in enumerate(starts):
+            rng = self._ranges.get(ws)
+            if rng is not None and rng[2]:
+                prices += [rng[0], rng[1]]
+            close = self._window_open(starts[i + 1]) if i + 1 < n else self._window_open(window_start)
+            if close is not None and close > 0:
+                prices.append(close)
+            elif rng is None:
+                return ""
+        up = (max(prices) / ref - 1) * 100
+        down = (min(prices) / ref - 1) * 100
+        if up < self.calm_skip_pct and -down < self.calm_skip_pct:
+            return ""
+        return f"not_calm {n}w up={up:+.2f}% down={down:+.2f}%"
 
     def _new_york_hours_skip_reason(self, window_start: int) -> str:
         """Skip reason when the decision point falls in the configured New York clock range; "" to trade."""
@@ -2464,7 +2503,7 @@ class FlatDualSimulator:
             )
             return
 
-        trend_reason = self._trend_skip_reason(window_start, current_price)
+        trend_reason = self._trend_skip_reason(window_start, current_price) or self._calm_skip_reason(window_start)
         if trend_reason:
             self._log_skip(
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask, trend_reason
@@ -2858,6 +2897,7 @@ class FlatDualSimulator:
         self._first_seen.setdefault(window_start, remaining_seconds)
         if price_to_beat > 0:
             self._opens[window_start] = price_to_beat
+        self._track_range(window_start, current_price, remaining_seconds)
         if volume_usd is not None:
             # Trades are only counted from subscription, so a late start undercounts the window.
             partial = volume_since is None or volume_since > window_start + 30
@@ -2896,8 +2936,9 @@ class FlatDualSimulator:
         self._ask_lows = {w: v for w, v in self._ask_lows.items() if w > window_start}
         self._ask_lows_after = {w: v for w, v in self._ask_lows_after.items() if w > window_start}
         self._interval_lows = {w: v for w, v in self._interval_lows.items() if w > window_start}
-        keep_from = window_start - 4 * self.duration_seconds
+        keep_from = window_start - max(4, self.calm_skip_windows + 1) * self.duration_seconds
         self._opens = {w: v for w, v in self._opens.items() if w >= keep_from}
+        self._ranges = {w: v for w, v in self._ranges.items() if w >= keep_from}
         self._volume = {w: v for w, v in self._volume.items() if w > window_start}
         self._decision_market = {w: v for w, v in self._decision_market.items() if w > window_start}
         self._volatility = {w: v for w, v in self._volatility.items() if w > window_start}

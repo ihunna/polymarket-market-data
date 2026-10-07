@@ -2271,6 +2271,7 @@ class FlatDualSimulator:
 
         self.delta_side_enabled = bool(cfg.get("delta_side_on_skip", False))
         self.delta_side_contracts = int(cfg.get("delta_side_contracts", 8))
+        self.delta_side_min_gap = float(cfg.get("delta_side_min_gap", 0.15))
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self._delta_open: dict[int, dict[str, Any]] = {}
         self.delta_equity = float(cfg.get("delta_side_capital", 100.0))
@@ -2523,15 +2524,18 @@ class FlatDualSimulator:
         down_ask: float,
         reason: str,
     ) -> None:
-        """Buy the side the PM delta points to at its ask in a window the dual skipped; held to resolution."""
+        """Buy the side priced as the likely winner in a window the dual skipped; held to resolution.
+
+        Only when the PM delta is at least delta_side_min_gap and points to that same side.
+        """
         if not self.delta_side_enabled or window_start in self._delta_open or self._new_york_hours_skip_reason(window_start):
             return
-        if current_price <= 0 or price_to_beat <= 0:
+        if current_price <= 0 or price_to_beat <= 0 or up_ask == down_ask:
             return
         gap = round(current_price - price_to_beat, 2)
-        if gap == 0:
+        side = "Up" if up_ask > down_ask else "Down"
+        if abs(gap) < self.delta_side_min_gap or (gap > 0) != (side == "Up"):
             return
-        side = "Up" if gap > 0 else "Down"
         price = up_ask if side == "Up" else down_ask
         if not 0.01 < price < 0.99:
             return

@@ -13,7 +13,12 @@ solana-5-opposite-trades.csv
 solana-60-opposite-trades.csv
 solana-15-trades-late_80.csv
 solana-*-flat-dual-trades.csv
+solana-*-flat-dual-trades.csv.bak
+solana-15-flat-dual-trades.csv.bak
+solana-5-flat-dual-trades.csv.bak
+solana-60-flat-dual-trades.csv.bak
 solana-15-opposite-trades.csv.bak
+solana-15-delta-side.*
 __pycache__/
 *.pyc
 scratch/

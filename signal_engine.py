@@ -243,6 +243,9 @@ DELTA_SIDE_TRADES_HEADER = [
     "contracts",
     "cost",
     "taker_fee",
+    "exit",
+    "exit_price",
+    "exit_time_left",
     "final_price",
     "outcome",
     "pnl",
@@ -2272,6 +2275,9 @@ class FlatDualSimulator:
         self.delta_side_enabled = bool(cfg.get("delta_side_on_skip", False))
         self.delta_side_contracts = int(cfg.get("delta_side_contracts", 8))
         self.delta_side_min_gap = float(cfg.get("delta_side_min_gap", 0.15))
+        self.delta_side_max_entry = float(cfg.get("delta_side_max_entry_cents", 99)) / 100.0
+        self.delta_side_take_profit = float(cfg.get("delta_side_take_profit_cents", 0)) / 100.0
+        self.delta_side_stop = float(cfg.get("delta_side_stop_cents", 0)) / 100.0
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self._delta_open: dict[int, dict[str, Any]] = {}
         self.delta_equity = float(cfg.get("delta_side_capital", 100.0))
@@ -2537,7 +2543,7 @@ class FlatDualSimulator:
         if abs(gap) < self.delta_side_min_gap or (gap > 0) != (side == "Up"):
             return
         price = up_ask if side == "Up" else down_ask
-        if not 0.01 < price < 0.99:
+        if not 0.01 < price < 0.99 or price > self.delta_side_max_entry + 1e-9:
             return
         contracts = self.delta_side_contracts
         fee = contracts * self.taker_fee_rate * price * (1.0 - price)
@@ -2565,6 +2571,28 @@ class FlatDualSimulator:
             f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
         )
 
+    def _update_delta_side(self, window_start: int, remaining: float, up_ask: float, down_ask: float) -> None:
+        """Take-profit / stop for an open delta-side trade. Our side's bid = 1 - the other side's ask."""
+        trade = self._delta_open.get(window_start)
+        if trade is None or trade.get("exit"):
+            return
+        other_ask = down_ask if trade["side"] == "Up" else up_ask
+        if not 0.0 < other_ask < 1.0:
+            return
+        bid = round(1.0 - other_ask, 2)
+        if self.delta_side_take_profit > 0 and bid >= self.delta_side_take_profit:
+            exit_kind, exit_price, exit_fee = "take_profit", self.delta_side_take_profit, 0.0
+        elif self.delta_side_stop > 0 and bid <= self.delta_side_stop:
+            exit_kind, exit_price = "stop", bid
+            exit_fee = trade["contracts"] * self.taker_fee_rate * bid * (1.0 - bid)
+        else:
+            return
+        trade.update(exit=exit_kind, exit_price=exit_price, exit_fee=exit_fee, exit_time_left=_format_mmss(remaining))
+        self._print_event(
+            f"{'💰' if exit_kind == 'take_profit' else '🛑'} [delta_side] {exit_kind} sold {trade['side']} @ {exit_price*100:.0f}¢ "
+            f"(bought {trade['entry_price']*100:.0f}¢) | {_format_mmss(remaining)} left | {trade['slug']}"
+        )
+
     def _settle_delta_side(self, window_start: int, outcome: str, final_price: float) -> None:
         trade = self._delta_open.pop(window_start, None)
         self._delta_open = {w: t for w, t in self._delta_open.items() if w > window_start}
@@ -2572,8 +2600,13 @@ class FlatDualSimulator:
             return
         price, contracts, fee = trade["entry_price"], trade["contracts"], trade["taker_fee"]
         notes = ""
-        if outcome in ("Up", "Down"):
+        if trade.get("exit"):
+            pnl = contracts * (trade["exit_price"] - price) - fee - trade.get("exit_fee", 0.0)
+            if trade.get("exit_fee"):
+                notes = f"exit_fee={trade['exit_fee']:.2f}"
+        elif outcome in ("Up", "Down"):
             pnl = contracts * ((1.0 if outcome == trade["side"] else 0.0) - price) - fee
+            trade["exit"] = "settled"
         else:
             pnl, notes = 0.0, "outcome_unknown"
         self.delta_equity += pnl
@@ -2585,6 +2618,13 @@ class FlatDualSimulator:
             notes=notes or "settled",
         )
         path = self.delta_log_file
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            with open(path, newline="", encoding="utf-8") as f:
+                existing = next(csv.reader(f), None)
+            if existing != DELTA_SIDE_TRADES_HEADER:
+                archived = f"{path}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
+                os.replace(path, archived)
+                print(f"⚠️  Delta-side trades log schema updated; old file moved to {archived}")
         new_file = not os.path.isfile(path) or os.path.getsize(path) == 0
         with open(path, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DELTA_SIDE_TRADES_HEADER, extrasaction="ignore")
@@ -3040,6 +3080,7 @@ class FlatDualSimulator:
         if price_to_beat > 0:
             self._opens[window_start] = price_to_beat
         self._track_range(window_start, current_price, remaining_seconds)
+        self._update_delta_side(window_start, remaining_seconds, up_ask, down_ask)
         if volume_usd is not None:
             # Trades are only counted from subscription, so a late start undercounts the window.
             partial = volume_since is None or volume_since > window_start + 30

@@ -99,5 +99,5 @@ strategies:
     delta_side_stop_wait_seconds: 120  # only sell if the bid stays at/below the stop this long; coming back above resets it
     delta_side_stop_floor_cents: 50    # planned mode: the stop is never set below this
     delta_side_contracts: 8
-    delta_side_capital: 100.0      # separate running balance, carried over from the last row of its log on restart
+    delta_side_capital: 100.0      # separate running balance; on restart: --ds-last, else last row of its log, else this
     # trades → {coin}-{duration}-flat-dual-trades.csv, delta-side trades → {coin}-{duration}-delta-side-trades.csv

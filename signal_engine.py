@@ -400,6 +400,29 @@ def _coin_slug_prefix(coin: str) -> str:
     return coin
 
 
+def last_capital_after(path: str, default: float) -> tuple[float, str]:
+    """Starting balance on restart: the last capital_after in the trades log, else default. Returns (amount, source)."""
+    if not path or not os.path.isfile(path):
+        return default, "config"
+    last = None
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("capital_after"):
+                last = row["capital_after"]
+    try:
+        return (float(last), "log") if last is not None else (default, "config")
+    except ValueError:
+        return default, "config"
+
+
+def starting_capital(cfg: dict[str, Any], key: str, restored_key: str, log_path: str) -> tuple[float, str]:
+    """CLI restore (--xx-last) > last capital_after in the log > config value."""
+    configured = float(cfg.get(key, 100.0))
+    if cfg.get(restored_key):
+        return configured, "cli"
+    return last_capital_after(log_path, configured)
+
+
 class CapitalManager:
     """Tracks free vs locked capital and per-window position locks."""
 
@@ -939,8 +962,9 @@ class DualHedgeSimulator:
         self.flat_short_max = float(cfg.get("flat_short_max", 0.30))
         self.regime = regime
 
+        start, self.capital_source = starting_capital(cfg, "capital", "capital_restored", self.trades_log_file)
         self.capital = CapitalManager(
-            total_capital=float(cfg["capital"]),
+            total_capital=start,
             investable_per_trade=float(cfg["investable_per_trade"]),
             capital_mode=str(cfg["capital_mode"]),
         )
@@ -1580,8 +1604,9 @@ class OppositeSideSimulator:
         self.skip_buy_down_when_bullish = bool(cfg.get("skip_buy_down_when_bullish", True))
         self.regime = regime
 
+        start, self.capital_source = starting_capital(cfg, "capital", "capital_restored", self.trades_log_file)
         self.capital = CapitalManager(
-            total_capital=float(cfg["capital"]),
+            total_capital=start,
             investable_per_trade=float(cfg["investable_per_trade"]),
             capital_mode=str(cfg["capital_mode"]),
         )
@@ -2266,8 +2291,9 @@ class FlatDualSimulator:
             cfg.get("trades_log_file") or flat_dual_trades_path(self.coin, self.duration_minutes)
         )
 
+        start, self.capital_source = starting_capital(cfg, "capital", "capital_restored", self.trades_log_file)
         self.capital = CapitalManager(
-            total_capital=float(cfg["capital"]),
+            total_capital=start,
             investable_per_trade=float(cfg["investable_per_trade"]),
             capital_mode=str(cfg["capital_mode"]),
         )
@@ -2283,9 +2309,9 @@ class FlatDualSimulator:
         self.delta_side_stop_floor = float(cfg.get("delta_side_stop_floor_cents", 0)) / 100.0
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self._delta_open: dict[int, dict[str, Any]] = {}
-        self.delta_equity = float(cfg.get("delta_side_capital", 100.0))
-        if self.delta_side_enabled:
-            self.delta_equity = self._last_delta_equity(self.delta_equity)
+        self.delta_equity, self.delta_capital_source = starting_capital(
+            cfg, "delta_side_capital", "delta_side_capital_restored", self.delta_log_file
+        )
 
         self.open_trades: dict[int, FlatDualOpenTrade] = {}
         self._decided_windows: set[int] = set()
@@ -2508,20 +2534,6 @@ class FlatDualSimulator:
         self._print_event(f"➖ [flat_dual] no entry | {reason} | {self._slug(window_start)}")
         if reason.startswith(DELTA_SIDE_SKIP_PREFIXES):
             self._open_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason)
-
-    def _last_delta_equity(self, default: float) -> float:
-        path = self.delta_log_file
-        if not os.path.isfile(path):
-            return default
-        last = None
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("capital_after"):
-                    last = row["capital_after"]
-        try:
-            return float(last) if last is not None else default
-        except ValueError:
-            return default
 
     def _open_delta_side(
         self,
@@ -3318,20 +3330,25 @@ class StrategyRunner:
         for s in self.strategies:
             if isinstance(s, DualHedgeSimulator):
                 lines.append(
-                    f"  dual_hedge: capital=${s.capital.equity:.2f} limit={s.limit_cents}¢ "
+                    f"  dual_hedge: capital=${s.capital.equity:.2f} (from {s.capital_source}) limit={s.limit_cents}¢ "
                     f"trades={s.trades_log_file} history={len(s.history)}"
                 )
             elif isinstance(s, OppositeSideSimulator):
                 lines.append(
-                    f"  opposite_side: capital=${s.capital.equity:.2f} limit={s.limit_cents}¢ "
+                    f"  opposite_side: capital=${s.capital.equity:.2f} (from {s.capital_source}) limit={s.limit_cents}¢ "
                     f"trades={s.trades_log_file} history={len(s.history)}"
                 )
             elif isinstance(s, FlatDualSimulator):
                 lines.append(
-                    f"  flat_dual: capital=${s.capital.equity:.2f} limit={s.limit_cents}¢ "
+                    f"  flat_dual: capital=${s.capital.equity:.2f} (from {s.capital_source}) limit={s.limit_cents}¢ "
                     f"max_move=${s.max_move:.2f} binance_max=${s.max_binance_move:.2f} decide_at={s.decision_remaining_seconds:.0f}s left "
                     f"trades={s.trades_log_file}"
                 )
+                if s.delta_side_enabled:
+                    lines.append(
+                        f"  delta_side: capital=${s.delta_equity:.2f} (from {s.delta_capital_source}) "
+                        f"max_entry={s.delta_side_max_entry*100:.0f}¢ trades={s.delta_log_file}"
+                    )
             else:
                 lines.append(f"  {type(s).__name__}")
         return "\n".join(lines) if lines else "  (no strategies enabled)"

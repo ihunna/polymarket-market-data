@@ -852,6 +852,13 @@ def parse_args():
         help="Restore flat_dual starting equity (overrides strategies.flat_dual.capital).",
     )
     parser.add_argument(
+        "--ds-last",
+        type=float,
+        default=None,
+        metavar="EQUITY",
+        help="Restore delta-side starting equity (overrides strategies.flat_dual.delta_side_capital).",
+    )
+    parser.add_argument(
         "--ref-price",
         type=float,
         default=None,
@@ -869,15 +876,23 @@ def parse_args():
 
 
 def apply_capital_overrides(
-    config: dict, dh_last: float | None, opp_last: float | None, fd_last: float | None = None
+    config: dict,
+    dh_last: float | None,
+    opp_last: float | None,
+    fd_last: float | None = None,
+    ds_last: float | None = None,
 ) -> list[str]:
-    """Apply CLI capital restores onto strategy configs. Returns human-readable notes."""
+    """Apply CLI capital restores onto strategy configs. Returns human-readable notes.
+
+    Without a flag, each strategy starts from the last capital_after in its own trades log (config value if none).
+    """
     notes: list[str] = []
     strategies = config.setdefault("strategies", {})
-    for flag, name, last in (
-        ("--dh-last", "dual_hedge", dh_last),
-        ("--opp-last", "opposite_side", opp_last),
-        ("--fd-last", "flat_dual", fd_last),
+    for flag, name, key, last in (
+        ("--dh-last", "dual_hedge", "capital", dh_last),
+        ("--opp-last", "opposite_side", "capital", opp_last),
+        ("--fd-last", "flat_dual", "capital", fd_last),
+        ("--ds-last", "flat_dual", "delta_side_capital", ds_last),
     ):
         if last is None:
             continue
@@ -886,9 +901,11 @@ def apply_capital_overrides(
         strategy = strategies.get(name)
         if not isinstance(strategy, dict):
             raise SystemExit(f"{flag} provided but strategies.{name} is missing")
-        prev = strategy.get("capital")
-        strategy["capital"] = float(last)
-        notes.append(f"{name} capital restored ${float(last):.2f} (config was ${float(prev):.2f})")
+        prev = strategy.get(key, 100.0)
+        strategy[key] = float(last)
+        strategy[f"{key}_restored"] = True
+        label = "delta_side" if key == "delta_side_capital" else name
+        notes.append(f"{label} capital restored ${float(last):.2f} (config was ${float(prev):.2f})")
     return notes
 
 
@@ -934,7 +951,7 @@ if __name__ == "__main__":
     DURATION_MINUTES = resolve_duration(args.duration, APP_CONFIG.get("duration_minutes"))
     WINDOW_DURATION_SECONDS = DURATION_MINUTES * 60
     APP_CONFIG = apply_duration_paths(APP_CONFIG, COIN_NAME, DURATION_MINUTES)
-    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last, args.fd_last)
+    restore_notes = apply_capital_overrides(APP_CONFIG, args.dh_last, args.opp_last, args.fd_last, args.ds_last)
     bias_notes = apply_bias_overrides(APP_CONFIG, args.ref_price, args.bias_mode)
 
     SIMULATOR = StrategyRunner.from_config(APP_CONFIG)

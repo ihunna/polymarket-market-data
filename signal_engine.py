@@ -2591,16 +2591,32 @@ class FlatDualSimulator:
             return
         bid = round(1.0 - other_ask, 2)
         stop = trade.get("stop_price", 0.0)
+        below_since = trade.get("below_stop_since")
         if self.delta_side_take_profit > 0 and bid >= self.delta_side_take_profit:
             exit_kind, exit_price, exit_fee = "take_profit", self.delta_side_take_profit, 0.0
-        elif stop > 0 and bid <= stop + 1e-9:
-            below_since = trade.setdefault("below_stop_since", remaining)
-            if below_since - remaining < self.delta_side_stop_wait:
+        elif below_since is None:
+            if not (stop > 0 and bid <= stop + 1e-9):
                 return
+            if self.delta_side_stop_wait > 0:
+                # Only the bid when the wait ends decides; bounces in between don't reset it.
+                trade["below_stop_since"] = remaining
+                self._print_event(
+                    f"⏳ [delta_side] {trade['side']} bid {bid*100:.0f}¢ hit stop {stop*100:.0f}¢ | "
+                    f"sell if still at/below it in {self.delta_side_stop_wait:.0f}s | {trade['slug']}"
+                )
+                return
+            exit_kind, exit_price = "stop", bid
+            exit_fee = trade["contracts"] * self.taker_fee_rate * bid * (1.0 - bid)
+        elif below_since - remaining < self.delta_side_stop_wait:
+            return
+        elif bid <= stop + 1e-9:
             exit_kind, exit_price = "stop", bid
             exit_fee = trade["contracts"] * self.taker_fee_rate * bid * (1.0 - bid)
         else:
             trade.pop("below_stop_since", None)
+            self._print_event(
+                f"↩️  [delta_side] {trade['side']} bid back to {bid*100:.0f}¢ (stop {stop*100:.0f}¢) after the wait | holding | {trade['slug']}"
+            )
             return
         trade.update(exit=exit_kind, exit_price=exit_price, exit_fee=exit_fee, exit_time_left=_format_mmss(remaining))
         self._print_event(

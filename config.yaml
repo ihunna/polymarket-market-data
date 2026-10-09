@@ -90,11 +90,14 @@ strategies:
     stop_sell_below_entry_cents: 5 # only sell if the bid is at least this far below what that side cost
     taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on cheap buys at the ask and on stop sells
     min_entry_ask_cents: 20        # skip the window if either side's ask is below this at the decision; 0 = off
-    delta_side_on_skip: true       # in trading hours, when the dual skips for moved / not_calm / trend / too_cheap, buy the higher-priced (likely winning) side at its ask and hold
+    delta_side_on_skip: true       # in trading hours, when the dual skips for moved / not_calm / trend / too_cheap, buy the higher-priced (likely winning) side at its ask
     delta_side_min_gap: 0.15       # only if |PM gap| is at least this and points to that same side
     delta_side_max_entry_cents: 90 # don't buy if the side costs more than this
     delta_side_take_profit_cents: 99  # resting sell: exit once our side's bid reaches this; 0 = hold to the end
-    delta_side_stop_cents: 30      # sell at the bid once it falls to this (cancels the take-profit); 0 = no stop
+    delta_side_stop_mode: planned  # planned = stop at entry - (take-profit - entry), i.e. lose what we planned to earn; fixed = delta_side_stop_cents
+    delta_side_stop_cents: 30      # fixed mode: sell at the bid once it falls to this (cancels the take-profit); 0 = no stop
+    delta_side_stop_wait_seconds: 120  # only sell if the bid stays at/below the stop this long; coming back above resets it
+    delta_side_stop_floor_cents: 50    # planned mode: the stop is never set below this
     delta_side_contracts: 8
     delta_side_capital: 100.0      # separate running balance, carried over from the last row of its log on restart
     # trades → {coin}-{duration}-flat-dual-trades.csv, delta-side trades → {coin}-{duration}-delta-side-trades.csv

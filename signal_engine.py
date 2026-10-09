@@ -2278,6 +2278,9 @@ class FlatDualSimulator:
         self.delta_side_max_entry = float(cfg.get("delta_side_max_entry_cents", 99)) / 100.0
         self.delta_side_take_profit = float(cfg.get("delta_side_take_profit_cents", 0)) / 100.0
         self.delta_side_stop = float(cfg.get("delta_side_stop_cents", 0)) / 100.0
+        self.delta_side_stop_mode = str(cfg.get("delta_side_stop_mode", "fixed")).strip().lower()
+        self.delta_side_stop_wait = float(cfg.get("delta_side_stop_wait_seconds", 0))
+        self.delta_side_stop_floor = float(cfg.get("delta_side_stop_floor_cents", 0)) / 100.0
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self._delta_open: dict[int, dict[str, Any]] = {}
         self.delta_equity = float(cfg.get("delta_side_capital", 100.0))
@@ -2547,7 +2550,13 @@ class FlatDualSimulator:
             return
         contracts = self.delta_side_contracts
         fee = contracts * self.taker_fee_rate * price * (1.0 - price)
+        if self.delta_side_stop_mode == "planned":
+            target = self.delta_side_take_profit if self.delta_side_take_profit > 0 else 1.0
+            stop_price = round(max(price - (target - price), self.delta_side_stop_floor, 0.0), 2)
+        else:
+            stop_price = self.delta_side_stop
         self._delta_open[window_start] = {
+            "stop_price": stop_price,
             "signal_timestamp": int(time.time()),
             "window_start": window_start,
             "slug": self._slug(window_start),
@@ -2568,7 +2577,8 @@ class FlatDualSimulator:
             "mode": self.mode,
         }
         self._print_event(
-            f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
+            f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} | stop {stop_price*100:.0f}¢"
+            f"{f' after {self.delta_side_stop_wait:.0f}s' if self.delta_side_stop_wait else ''} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
         )
 
     def _update_delta_side(self, window_start: int, remaining: float, up_ask: float, down_ask: float) -> None:
@@ -2580,12 +2590,17 @@ class FlatDualSimulator:
         if not 0.0 < other_ask < 1.0:
             return
         bid = round(1.0 - other_ask, 2)
+        stop = trade.get("stop_price", 0.0)
         if self.delta_side_take_profit > 0 and bid >= self.delta_side_take_profit:
             exit_kind, exit_price, exit_fee = "take_profit", self.delta_side_take_profit, 0.0
-        elif self.delta_side_stop > 0 and bid <= self.delta_side_stop:
+        elif stop > 0 and bid <= stop + 1e-9:
+            below_since = trade.setdefault("below_stop_since", remaining)
+            if below_since - remaining < self.delta_side_stop_wait:
+                return
             exit_kind, exit_price = "stop", bid
             exit_fee = trade["contracts"] * self.taker_fee_rate * bid * (1.0 - bid)
         else:
+            trade.pop("below_stop_since", None)
             return
         trade.update(exit=exit_kind, exit_price=exit_price, exit_fee=exit_fee, exit_time_left=_format_mmss(remaining))
         self._print_event(
@@ -2599,16 +2614,17 @@ class FlatDualSimulator:
         if trade is None:
             return
         price, contracts, fee = trade["entry_price"], trade["contracts"], trade["taker_fee"]
-        notes = ""
+        notes = f"stop={trade.get('stop_price', 0)*100:.0f}c wait={self.delta_side_stop_wait:.0f}s"
         if trade.get("exit"):
             pnl = contracts * (trade["exit_price"] - price) - fee - trade.get("exit_fee", 0.0)
             if trade.get("exit_fee"):
-                notes = f"exit_fee={trade['exit_fee']:.2f}"
+                notes += f" exit_fee={trade['exit_fee']:.2f}"
         elif outcome in ("Up", "Down"):
             pnl = contracts * ((1.0 if outcome == trade["side"] else 0.0) - price) - fee
             trade["exit"] = "settled"
         else:
-            pnl, notes = 0.0, "outcome_unknown"
+            pnl = 0.0
+            notes += " outcome_unknown"
         self.delta_equity += pnl
         trade.update(
             final_price=round(final_price, 2) if final_price else "",

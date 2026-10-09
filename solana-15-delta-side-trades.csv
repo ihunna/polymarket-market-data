@@ -1,20 +1,7 @@
-signal_timestamp,window_start,slug,remaining_at_entry,dual_skip_reason,price_to_beat,price_at_entry,gap_at_entry,binance_gap_at_entry,up_ask_at_entry,down_ask_at_entry,side,entry_price,contracts,cost,taker_fee,final_price,outcome,pnl,capital_before,capital_after,mode,notes
-1791450300,1791450000,sol-updown-15m-1791450000,10:00,moved gap=+0.28 binance=+0.32,114.82,115.1,0.28,0.32,0.96,0.05,Up,0.96,8,7.68,0.0215,115.04,Up,0.3,100.0,100.3,simulate,settled
-1791451200,1791450900,sol-updown-15m-1791450900,10:00,moved gap=-0.25 binance=-0.15,115.04,114.79,-0.25,-0.15,0.18,0.84,Down,0.84,8,6.72,0.0753,114.94,Down,1.2,100.3,101.5,simulate,settled
-1791452100,1791451800,sol-updown-15m-1791451800,10:00,moved gap=+0.29 binance=+0.20,114.94,115.23,0.29,0.2,0.9,0.11,Up,0.9,8,7.2,0.0504,115.07,Up,0.75,101.5,102.25,simulate,settled
-1791456600,1791456300,sol-updown-15m-1791456300,10:00,moved gap=-0.27 binance=-0.18,114.42,114.15,-0.27,-0.18,0.25,0.76,Down,0.76,8,6.08,0.1021,114.37,Down,1.82,102.25,104.07,simulate,settled
-1791457500,1791457200,sol-updown-15m-1791457200,10:00,moved gap=-0.32 binance=-0.30,114.37,114.05,-0.32,-0.3,0.14,0.88,Down,0.88,8,7.04,0.0591,113.64,Down,0.9,104.07,104.97,simulate,settled
-1791458400,1791458100,sol-updown-15m-1791458100,10:00,moved gap=-0.33 binance=-0.32,113.64,113.31,-0.33,-0.32,0.16,0.87,Down,0.87,8,6.96,0.0633,113.58,Down,0.98,104.97,105.95,simulate,settled
-1791459300,1791459000,sol-updown-15m-1791459000,10:00,moved gap=-0.16 binance=-0.23,113.58,113.42,-0.16,-0.23,0.2,0.82,Down,0.82,8,6.56,0.0827,113.48,Down,1.36,105.95,107.31,simulate,settled
-1791460200,1791459900,sol-updown-15m-1791459900,10:00,not_calm 3w up=+0.00% down=-1.01%,113.48,113.33,-0.15,-0.08,0.33,0.68,Down,0.68,8,5.44,0.1219,113.08,Down,2.44,107.31,109.74,simulate,settled
-1791461100,1791460800,sol-updown-15m-1791460800,10:00,moved gap=-0.16 binance=-0.16,113.08,112.93,-0.16,-0.16,0.23,0.79,Down,0.79,8,6.32,0.0929,112.94,Down,1.59,109.74,111.33,simulate,settled
-1791463800,1791463500,sol-updown-15m-1791463500,10:00,moved gap=-0.29 binance=-0.24,112.79,112.5,-0.29,-0.24,0.11,0.91,Down,0.91,8,7.28,0.0459,112.39,Down,0.67,111.33,112.0,simulate,settled
-1791464700,1791464400,sol-updown-15m-1791464400,10:00,moved gap=-0.56 binance=-0.63,112.39,111.82,-0.56,-0.63,0.08,0.93,Down,0.93,8,7.44,0.0365,112.54,Up,-7.48,112.0,104.53,simulate,settled
-1791465600,1791465300,sol-updown-15m-1791465300,10:00,moved gap=+0.20 binance=+0.23,112.54,112.74,0.2,0.23,0.8,0.21,Up,0.8,8,6.4,0.0896,112.32,Down,-6.49,104.53,98.04,simulate,settled
-1791466500,1791466200,sol-updown-15m-1791466200,10:00,moved gap=-0.22 binance=-0.17,112.32,112.1,-0.22,-0.17,0.28,0.73,Down,0.73,8,5.84,0.1104,111.63,Down,2.05,98.04,100.09,simulate,settled
-1791467400,1791467100,sol-updown-15m-1791467100,10:00,moved gap=+0.17 binance=+0.25,111.63,111.8,0.17,0.25,0.82,0.22,Up,0.82,8,6.56,0.0827,112.21,Up,1.36,100.09,101.45,simulate,settled
-1791471000,1791470700,sol-updown-15m-1791470700,10:00,moved gap=+0.21 binance=+0.24,112.18,112.39,0.21,0.24,0.85,0.16,Up,0.85,8,6.8,0.0714,112.5,Up,1.13,101.45,102.57,simulate,settled
-1791471900,1791471600,sol-updown-15m-1791471600,10:00,moved gap=-0.44 binance=-0.41,112.5,112.06,-0.44,-0.41,0.06,0.96,Down,0.96,8,7.68,0.0215,111.09,Down,0.3,102.57,102.87,simulate,settled
-1791472800,1791472500,sol-updown-15m-1791472500,10:00,moved gap=-0.48 binance=-0.11,111.09,110.6,-0.48,-0.11,0.33,0.72,Down,0.72,8,5.76,0.1129,108.91,Down,2.13,102.87,105.0,simulate,settled
-1791473700,1791473400,sol-updown-15m-1791473400,10:00,moved gap=-0.15 binance=-0.47,108.91,108.76,-0.15,-0.47,0.28,0.75,Down,0.75,8,6.0,0.105,109.04,Up,-6.11,105.0,98.89,simulate,settled
-1791474600,1791474300,sol-updown-15m-1791474300,10:00,moved gap=+0.15 binance=+0.30,109.04,109.19,0.15,0.3,0.78,0.24,Up,0.78,8,6.24,0.0961,108.47,Down,-6.34,98.89,92.56,simulate,settled
+signal_timestamp,window_start,slug,remaining_at_entry,dual_skip_reason,price_to_beat,price_at_entry,gap_at_entry,binance_gap_at_entry,up_ask_at_entry,down_ask_at_entry,side,entry_price,contracts,cost,taker_fee,exit,exit_price,exit_time_left,final_price,outcome,pnl,capital_before,capital_after,mode,notes
+1791546600,1791546300,sol-updown-15m-1791546300,10:00,moved gap=+0.66 binance=+0.51,110.75,111.41,0.66,0.51,0.87,0.14,Up,0.87,8,6.96,0.0633,take_profit,0.99,02:40,111.15,Up,0.9,100.0,100.9,simulate,stop=75c wait=120s
+1791553800,1791553500,sol-updown-15m-1791553500,10:00,moved gap=+0.33 binance=+0.39,109.32,109.65,0.33,0.39,0.86,0.15,Up,0.86,8,6.88,0.0674,take_profit,0.99,02:46,109.52,Up,0.97,100.9,101.87,simulate,stop=73c wait=120s
+1791555600,1791555300,sol-updown-15m-1791555300,10:00,moved gap=+0.33 binance=+0.33,109.63,109.96,0.33,0.33,0.89,0.12,Up,0.89,8,7.12,0.0548,take_profit,0.99,03:53,110.3,Up,0.75,101.87,102.61,simulate,stop=79c wait=120s
+1791556500,1791556200,sol-updown-15m-1791556200,10:00,moved gap=+0.16 binance=+0.23,110.3,110.46,0.16,0.23,0.78,0.23,Up,0.78,8,6.24,0.0961,stop,0.33,06:22,109.98,Down,-3.82,102.61,98.79,simulate,stop=57c wait=120s exit_fee=0.12
+1791558300,1791558000,sol-updown-15m-1791558000,10:00,moved gap=-0.29 binance=-0.24,110.04,109.74,-0.29,-0.24,0.2,0.82,Down,0.82,8,6.56,0.0827,take_profit,0.99,02:59,109.4,Down,1.28,98.79,100.07,simulate,stop=65c wait=120s
+1791560100,1791559800,sol-updown-15m-1791559800,10:00,moved gap=+0.15 binance=+0.28,109.34,109.49,0.15,0.28,0.85,0.16,Up,0.85,8,6.8,0.0714,take_profit,0.99,03:22,109.67,Up,1.05,100.07,101.12,simulate,stop=71c wait=120s

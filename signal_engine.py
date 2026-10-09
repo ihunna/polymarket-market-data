@@ -2312,6 +2312,10 @@ class FlatDualSimulator:
         self.delta_equity, self.delta_capital_source = starting_capital(
             cfg, "delta_side_capital", "delta_side_capital_restored", self.delta_log_file
         )
+        self.daily_profit_stop = float(cfg.get("daily_profit_stop_usd", 0))
+        self._day_pnl: dict[Any, float] = {}
+        if self.daily_profit_stop > 0:
+            self._load_day_pnl()
 
         self.open_trades: dict[int, FlatDualOpenTrade] = {}
         self._decided_windows: set[int] = set()
@@ -2535,6 +2539,49 @@ class FlatDualSimulator:
         if reason.startswith(DELTA_SIDE_SKIP_PREFIXES):
             self._open_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason)
 
+    def _trading_day(self, window_start: int) -> Any:
+        """New York date of the decision point; the whole 10am-5pm session falls on one."""
+        decision_at = window_start + self.duration_seconds - self.decision_remaining_seconds
+        return datetime.fromtimestamp(decision_at, NEW_YORK).date()
+
+    def _load_day_pnl(self) -> None:
+        """Rebuild today's realised pnl (dual + delta side) from the logs, so a restart keeps the daily stop."""
+        today = datetime.now(NEW_YORK).date()
+        for path, is_dual in ((self.trades_log_file, True), (self.delta_log_file, False)):
+            if not os.path.isfile(path):
+                continue
+            with open(path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if not row.get("pnl") or (is_dual and row.get("fill_type") in ("skipped", "")):
+                        continue
+                    try:
+                        ws, pnl = int(row["window_start"]), float(row["pnl"])
+                    except (KeyError, ValueError):
+                        continue
+                    day = self._trading_day(ws)
+                    if day == today:
+                        self._day_pnl[day] = self._day_pnl.get(day, 0.0) + pnl
+
+    def _add_day_pnl(self, window_start: int, pnl: float) -> None:
+        if self.daily_profit_stop <= 0:
+            return
+        day = self._trading_day(window_start)
+        before = self._day_pnl.get(day, 0.0)
+        self._day_pnl[day] = before + pnl
+        if before < self.daily_profit_stop <= self._day_pnl[day]:
+            self._print_event(
+                f"🏁 [daily_target] day's profit {self._day_pnl[day]:+.2f} reached +{self.daily_profit_stop:.2f} "
+                f"(dual + delta side) | no new trades until tomorrow"
+            )
+
+    def _daily_target_reason(self, window_start: int) -> str:
+        if self.daily_profit_stop <= 0:
+            return ""
+        day_pnl = self._day_pnl.get(self._trading_day(window_start), 0.0)
+        if day_pnl >= self.daily_profit_stop:
+            return f"daily_target day_pnl={day_pnl:+.2f} target=+{self.daily_profit_stop:.2f}"
+        return ""
+
     def _open_delta_side(
         self,
         window_start: int,
@@ -2654,6 +2701,7 @@ class FlatDualSimulator:
             pnl = 0.0
             notes += " outcome_unknown"
         self.delta_equity += pnl
+        self._add_day_pnl(window_start, pnl)
         trade.update(
             final_price=round(final_price, 2) if final_price else "",
             outcome=outcome,
@@ -2714,6 +2762,10 @@ class FlatDualSimulator:
         self._decided_windows.add(window_start)
         gap = round(current_price - price_to_beat, 2)
         self._record_volatility(window_start, current_price - price_to_beat, remaining, up_ask, down_ask)
+        daily_reason = "" if self._new_york_hours_skip_reason(window_start) else self._daily_target_reason(window_start)
+        if daily_reason:
+            self._log_skip(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, daily_reason)
+            return
         binance_gap = self._binance_gap_value()
         binance_moved = binance_gap is not None and abs(binance_gap) > self.max_binance_move
         if abs(gap) > self.max_move or binance_moved:
@@ -3205,6 +3257,7 @@ class FlatDualSimulator:
             notes.append(f"taker_fee={trade.entry_fees:.2f}")
 
         _, free_after, equity_after = self.capital.release(window_start, pnl)
+        self._add_day_pnl(window_start, pnl)
         self._append_row(
             {
                 **gap_fields,

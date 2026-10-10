@@ -386,6 +386,19 @@ def _parse_clock_range(value: Any) -> tuple[int, int] | None:
     return start, end
 
 
+def _with_delta_side_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the flat_dual `delta_side:` block into the delta_side_* keys the engine reads.
+
+    Top-level delta_side_* keys win, so --ds-last (which writes delta_side_capital) still overrides the block.
+    """
+    block = cfg.get("delta_side")
+    if not isinstance(block, dict):
+        return cfg
+    renamed = {"enabled": "delta_side_on_skip"}
+    flat = {renamed.get(k, f"delta_side_{k}"): v for k, v in block.items()}
+    return {**flat, **cfg}
+
+
 def _stdev(values: list[float]) -> float | None:
     if len(values) < 2:
         return None
@@ -2254,7 +2267,7 @@ class FlatDualSimulator:
         self.mode = str(global_config["mode"])
         self.regime = regime
 
-        cfg = strategy_config
+        cfg = _with_delta_side_block(strategy_config)
         self.limit_cents = int(cfg["limit_cents"])
         self.limit_price = self.limit_cents / 100.0
         self.max_move = float(cfg["max_move"])
@@ -2277,6 +2290,11 @@ class FlatDualSimulator:
         self.min_trades_before_decision = int(cfg.get("min_trades_before_decision", 0))
         self.min_volume_before_decision = float(cfg.get("min_volume_before_decision_usd", 0))
         self.skip_new_york_hours = _parse_clock_range(cfg.get("skip_new_york_hours"))
+        self.delta_side_skip_new_york_hours = _parse_clock_range(
+            cfg.get("delta_side_skip_new_york_hours", cfg.get("skip_new_york_hours"))
+        )
+        self.dual_new_york_hours = _parse_clock_range(cfg.get("dual_new_york_hours"))
+        self.dual_weekdays_only = bool(cfg.get("dual_weekdays_only", False))
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2309,6 +2327,7 @@ class FlatDualSimulator:
         self.delta_side_stop_floor = float(cfg.get("delta_side_stop_floor_cents", 0)) / 100.0
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self.delta_side_recheck_until = float(cfg.get("delta_side_recheck_until_seconds", 0))
+        self.delta_side_all_windows = bool(cfg.get("delta_side_all_windows", False))
         self._delta_open: dict[int, dict[str, Any]] = {}
         self._delta_pending: dict[int, str] = {}
         self.delta_equity, self.delta_capital_source = starting_capital(
@@ -2450,16 +2469,30 @@ class FlatDualSimulator:
             return ""
         return f"not_calm {n}w up={up:+.2f}% down={down:+.2f}%"
 
-    def _new_york_hours_skip_reason(self, window_start: int) -> str:
+    def _new_york_hours_skip_reason(self, window_start: int, hours: tuple[int, int] | None | str = "dual") -> str:
         """Skip reason when the decision point falls in the configured New York clock range; "" to trade."""
-        if self.skip_new_york_hours is None:
+        if hours == "dual":
+            hours = self.skip_new_york_hours
+        if hours is None:
             return ""
         decision_at = window_start + self.duration_seconds - self.decision_remaining_seconds
         ny = datetime.fromtimestamp(decision_at, NEW_YORK)
         minute = ny.hour * 60 + ny.minute
-        start, end = self.skip_new_york_hours
+        start, end = hours
         inside = start <= minute < end if start <= end else (minute >= start or minute < end)
         return f"outside_us_hours ny={ny:%H:%M}" if inside else ""
+
+    def _dual_slot_skip_reason(self, window_start: int) -> str:
+        """The dual only trades windows starting inside dual_new_york_hours (and on weekdays if set); "" to trade."""
+        ny = datetime.fromtimestamp(window_start, NEW_YORK)
+        if self.dual_weekdays_only and ny.weekday() >= 5:
+            return f"dual_slot weekend ny={ny:%a %H:%M}"
+        if self.dual_new_york_hours is None:
+            return ""
+        minute = ny.hour * 60 + ny.minute
+        start, end = self.dual_new_york_hours
+        inside = start <= minute < end if start <= end else (minute >= start or minute < end)
+        return "" if inside else f"dual_slot ny={ny:%a %H:%M}"
 
     def _record_volatility(
         self, window_start: int, gap: float, remaining: float, up_ask: float, down_ask: float
@@ -2538,7 +2571,7 @@ class FlatDualSimulator:
         )
         self.status_line = f"fd skip {reason}"
         self._print_event(f"➖ [flat_dual] no entry | {reason} | {self._slug(window_start)}")
-        if reason.startswith(DELTA_SIDE_SKIP_PREFIXES):
+        if reason.startswith(DELTA_SIDE_SKIP_PREFIXES) or (self.delta_side_all_windows and reason.startswith("dual_slot")):
             self._open_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason)
             if window_start not in self._delta_open and self.delta_side_recheck_until > 0:
                 self._delta_pending[window_start] = reason
@@ -2612,7 +2645,9 @@ class FlatDualSimulator:
 
         Only when the PM delta is at least delta_side_min_gap and points to that same side.
         """
-        if not self.delta_side_enabled or window_start in self._delta_open or self._new_york_hours_skip_reason(window_start):
+        if not self.delta_side_enabled or window_start in self._delta_open:
+            return
+        if self._new_york_hours_skip_reason(window_start, self.delta_side_skip_new_york_hours):
             return
         if self._daily_target_reason(window_start):
             return
@@ -2832,6 +2867,11 @@ class FlatDualSimulator:
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask,
                 f"low_volume trades={trades} ${market.get('volume_before_usd', 0):.2f}",
             )
+            return
+
+        slot_reason = self._dual_slot_skip_reason(window_start)
+        if slot_reason:
+            self._log_skip(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, slot_reason)
             return
 
         free_before = self.capital.free_capital

@@ -81,7 +81,9 @@ strategies:
     calm_skip_windows: 3
     min_trades_before_decision: 0    # skip if fewer than this many trades in the window before the decision; 0 = off (still logged)
     min_volume_before_decision_usd: 0   # skip if less than this many $ traded in the window before the decision; 0 = off (still logged)
-    skip_new_york_hours: "12:00-05:00"  # skip if the decision point is in this New York clock range (trade 05:00-12:00 NY = 10am-5pm UTC+1), every day; "" = off
+    skip_new_york_hours: ""             # dual: skip if the decision point is in this New York clock range ("12:00-05:00" = trade 10am-5pm UTC+1); "" = off. Off while the dual is log-only so ds sees every window's real skip reason
+    dual_new_york_hours: "00:00-00:00"  # dual only for windows starting in this New York range; "00:00-00:00" = never (dual log-only, delta side unaffected); "" = off
+    dual_weekdays_only: true            # no dual on Sat/Sun (New York date); delta side still trades
     decision_tolerance_seconds: 60 # give up if no price/asks within this long after the decision point
     cancel_remaining_seconds: 0    # cancel unfilled limits with this many seconds left; 0 = never
     cancel_move: 0                 # after entry, if no side has filled, cancel both limits once the PM or Binance gap exceeds this; 0 = never
@@ -90,16 +92,26 @@ strategies:
     stop_sell_below_entry_cents: 5 # only sell if the bid is at least this far below what that side cost
     taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on cheap buys at the ask and on stop sells
     min_entry_ask_cents: 20        # skip the window if either side's ask is below this at the decision; 0 = off
-    delta_side_on_skip: true       # in trading hours, when the dual skips for moved / not_calm / trend / too_cheap, buy the higher-priced (likely winning) side at its ask
-    delta_side_min_gap: 0.15       # only if |PM gap| is at least this and points to that same side
-    delta_side_max_entry_cents: 90 # don't buy if the side costs more than this
-    delta_side_take_profit_cents: 99  # resting sell: exit once our side's bid reaches this; 0 = hold to the end
-    delta_side_stop_mode: planned  # planned = stop at entry - (take-profit - entry), i.e. lose what we planned to earn; fixed = delta_side_stop_cents
-    delta_side_stop_cents: 30      # fixed mode: sell at the bid once it falls to this (cancels the take-profit); 0 = no stop
-    delta_side_stop_wait_seconds: 120  # only sell if the bid stays at/below the stop this long; coming back above resets it
-    delta_side_stop_floor_cents: 50    # planned mode: the stop is never set below this
-    delta_side_recheck_until_seconds: 360  # filters fail at 10:00 left: keep checking them until 6:00 left (0 = decision only)
-    delta_side_contracts: 8
-    delta_side_capital: 100.0      # separate running balance; on restart: --ds-last, else last row of its log, else this
     daily_profit_stop_usd: 10      # once the day's realised profit (dual + delta side) reaches this, no new trades until tomorrow; 0 = off
     # trades → {coin}-{duration}-flat-dual-trades.csv, delta-side trades → {coin}-{duration}-delta-side-trades.csv
+
+    # Delta side (ds): buy the side the price is running toward, in windows the dual skips.
+    # Uses this strategy's price feed and decision point (10:00 left); own settings, balance and log.
+    delta_side:
+      enabled: true
+      # when
+      skip_new_york_hours: ""      # skip if the decision point is in this New York clock range; "" = every hour (trial); "12:00-05:00" = 10am-5pm UTC+1
+      all_windows: true            # also windows the dual would have entered (skip reason dual_slot); false = only moved / not_calm / trend / too_cheap skips. Replay 10-5: -56.66 on 103 tr
+      recheck_until_seconds: 360   # filters fail at 10:00 left: keep checking every tick until this many seconds left; 0 = 10:00 only
+      # entry
+      min_gap: 0.12                # |PM gap| at least this and pointing to the favourite
+      max_entry_cents: 90          # don't buy the favourite above this
+      # exit
+      take_profit_cents: 99        # resting sell (no fee), fills when our bid (1 - other side's ask) reaches this; 0 = hold to the end
+      stop_mode: planned           # planned = stop at entry - (take_profit - entry); fixed = stop_cents
+      stop_cents: 30               # fixed mode only
+      stop_floor_cents: 50         # planned mode: the stop is never set below this
+      stop_wait_seconds: 120       # once the bid touches the stop, sell only if it's still at/below it this long after (bounces in between don't reset it)
+      # size
+      contracts: 8
+      capital: 100.0               # running balance; on restart: --ds-last, else last row of its log, else this

@@ -856,7 +856,7 @@ def parse_args():
         type=float,
         default=None,
         metavar="EQUITY",
-        help="Restore delta-side starting equity (overrides strategies.flat_dual.delta_side_capital).",
+        help="Restore delta-side starting equity (overrides strategies.flat_dual.delta_side.capital).",
     )
     parser.add_argument(
         "--ref-price",

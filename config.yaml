@@ -70,7 +70,7 @@ strategies:
     capital_mode: locked
     limit_cents: 30                # per-side price; a side already below this is bought at its ask
     max_move: 0.07               # max |price - price_to_beat| at the decision point
-    max_binance_move: 0.15       # max |binance - price_to_beat| at the decision point; ignored (pm_only) if no Binance price
+    max_binance_move: 0.07       # max |binance - price_to_beat| at the decision point (same as max_move); ignored (pm_only) if no Binance price
     decision_fraction: 0.26667     # decide once this share of the window has elapsed (11:00 left on 15m; 0.33334 = 10:00)
     # log-only: Up/Down prices and gaps at these shares of the window; every minute from 14:00 to 01:00 left on 15m
     early_check_fractions: [0.066667, 0.133333, 0.2, 0.266667, 0.333333, 0.4, 0.466667, 0.533333, 0.6, 0.666667, 0.733333, 0.8, 0.866667, 0.933333]

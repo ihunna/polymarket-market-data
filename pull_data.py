@@ -25,6 +25,9 @@ DEFAULT_FILES = [
     "solana-15-flat-dual-trades.csv",
     "solana-15-delta-side-trades.csv",
     "solana-15-updown.csv",
+    # logs the bot archived after a column change; without these a pull after a restart replaces the history
+    "solana-15-flat-dual-trades.csv.2*.bak",
+    "solana-15-delta-side-trades.csv.2*.bak",
 ]
 PASSWORD_ENV = "PM_SSH_PASSWORD"
 
@@ -66,14 +69,12 @@ def main() -> int:
         ]
         result = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL)
 
-        pulled, missing = [], []
-        for name in args.files:
-            src = tmp / name
-            if src.exists():
-                shutil.move(str(src), dest / name)
-                pulled.append(name)
-            else:
-                missing.append(name)
+        pulled = []
+        for src in sorted(tmp.iterdir()):
+            if src.name != "askpass.sh":
+                shutil.move(str(src), dest / src.name)
+                pulled.append(src.name)
+        missing = [n for n in args.files if not any(Path(p).match(n) for p in pulled)]
 
     for name in pulled:
         size = (dest / name).stat().st_size
@@ -82,7 +83,7 @@ def main() -> int:
         print(f"❌ {name} not pulled")
     if result.returncode != 0 and not pulled:
         print("scp failed (wrong password or host unreachable?)", file=sys.stderr)
-    return 0 if not missing else 1
+    return 0 if pulled else 1
 
 
 if __name__ == "__main__":

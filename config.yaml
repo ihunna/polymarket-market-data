@@ -92,7 +92,7 @@ strategies:
     stop_sell_below_entry_cents: 5 # only sell if the bid is at least this far below what that side cost
     taker_fee_rate: 0.07           # Polymarket crypto taker fee: shares x rate x p x (1 - p); charged on cheap buys at the ask and on stop sells
     min_entry_ask_cents: 20        # skip the window if either side's ask is below this at the decision; 0 = off
-    daily_profit_stop_usd: 10      # once the day's realised profit (dual + delta side) reaches this, no new trades until tomorrow; 0 = off
+    daily_profit_stop_usd: 0       # off for the all-hours ds trial (week of 10 Oct); was 10. Once the day's realised profit (dual + delta side) reaches this, no new trades until tomorrow; 0 = off
     # trades → {coin}-{duration}-flat-dual-trades.csv, delta-side trades → {coin}-{duration}-delta-side-trades.csv
 
     # Delta side (ds): buy the side the price is running toward, in windows the dual skips.

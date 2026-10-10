@@ -2328,6 +2328,7 @@ class FlatDualSimulator:
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
         self.delta_side_recheck_until = float(cfg.get("delta_side_recheck_until_seconds", 0))
         self.delta_side_all_windows = bool(cfg.get("delta_side_all_windows", False))
+        self.delta_side_max_loss_pct = float(cfg.get("delta_side_max_loss_pct", 0)) / 100.0
         self._delta_open: dict[int, dict[str, Any]] = {}
         self._delta_pending: dict[int, str] = {}
         self.delta_equity, self.delta_capital_source = starting_capital(
@@ -2667,8 +2668,10 @@ class FlatDualSimulator:
             stop_price = round(max(price - (target - price), self.delta_side_stop_floor, 0.0), 2)
         else:
             stop_price = self.delta_side_stop
+        max_loss_price = round(max(price * (1.0 - self.delta_side_max_loss_pct), 0.01), 2) if self.delta_side_max_loss_pct > 0 else 0.0
         self._delta_open[window_start] = {
             "stop_price": stop_price,
+            "max_loss_price": max_loss_price,
             "signal_timestamp": int(time.time()),
             "window_start": window_start,
             "slug": self._slug(window_start),
@@ -2690,7 +2693,8 @@ class FlatDualSimulator:
         }
         self._print_event(
             f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} at {_format_mmss(remaining)} left | stop {stop_price*100:.0f}¢"
-            f"{f' after {self.delta_side_stop_wait:.0f}s' if self.delta_side_stop_wait else ''} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
+            f"{f' after {self.delta_side_stop_wait:.0f}s' if self.delta_side_stop_wait else ''}"
+            f"{f' | max loss at {max_loss_price*100:.0f}¢' if max_loss_price else ''} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
         )
 
     def _update_delta_side(self, window_start: int, remaining: float, up_ask: float, down_ask: float) -> None:
@@ -2704,8 +2708,13 @@ class FlatDualSimulator:
         bid = round(1.0 - other_ask, 2)
         stop = trade.get("stop_price", 0.0)
         below_since = trade.get("below_stop_since")
+        max_loss_price = trade.get("max_loss_price", 0.0)
         if self.delta_side_take_profit > 0 and bid >= self.delta_side_take_profit:
             exit_kind, exit_price, exit_fee = "take_profit", self.delta_side_take_profit, 0.0
+        elif max_loss_price > 0 and bid <= max_loss_price + 1e-9:
+            # Hard cap: no wait, even mid-wait on the planned stop.
+            exit_kind, exit_price = "max_loss", bid
+            exit_fee = trade["contracts"] * self.taker_fee_rate * bid * (1.0 - bid)
         elif below_since is None:
             if not (stop > 0 and bid <= stop + 1e-9):
                 return
@@ -2744,6 +2753,8 @@ class FlatDualSimulator:
             return
         price, contracts, fee = trade["entry_price"], trade["contracts"], trade["taker_fee"]
         notes = f"stop={trade.get('stop_price', 0)*100:.0f}c wait={self.delta_side_stop_wait:.0f}s"
+        if trade.get("max_loss_price"):
+            notes += f" max_loss={trade['max_loss_price']*100:.0f}c"
         if trade.get("exit"):
             pnl = contracts * (trade["exit_price"] - price) - fee - trade.get("exit_fee", 0.0)
             if trade.get("exit_fee"):

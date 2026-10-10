@@ -112,6 +112,7 @@ strategies:
       stop_cents: 30               # fixed mode only
       stop_floor_cents: 50         # planned mode: the stop is never set below this
       stop_wait_seconds: 120       # once the bid touches the stop, sell only if it's still at/below it this long after (bounces in between don't reset it)
+      max_loss_pct: 50             # hard cap: sell at once (no wait) if the bid falls this % below entry, i.e. lose at most ~50% of the stake; 0 = off. Replay 10-5: 50% +19.74, 75% +42.90, none +41.91 (all hours -4.96 / +14.42 / +13.63)
       # size
       contracts: 8
       capital: 100.0               # running balance; on restart: --ds-last, else last row of its log, else this

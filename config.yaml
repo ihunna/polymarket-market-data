@@ -69,9 +69,9 @@ strategies:
     investable_per_trade: 5.0
     capital_mode: locked
     limit_cents: 30                # per-side price; a side already below this is bought at its ask
-    max_move: 0.09               # max |price - price_to_beat| at the decision point (gap is in cents, so 0.09 = under 0.10)
+    max_move: 0.07               # max |price - price_to_beat| at the decision point
     max_binance_move: 0.15       # max |binance - price_to_beat| at the decision point; ignored (pm_only) if no Binance price
-    decision_fraction: 0.33334     # decide once this share of the window has elapsed (10:00 left on 15m)
+    decision_fraction: 0.26667     # decide once this share of the window has elapsed (11:00 left on 15m; 0.33334 = 10:00)
     # log-only: Up/Down prices and gaps at these shares of the window; every minute from 14:00 to 01:00 left on 15m
     early_check_fractions: [0.066667, 0.133333, 0.2, 0.266667, 0.333333, 0.4, 0.466667, 0.533333, 0.6, 0.666667, 0.733333, 0.8, 0.866667, 0.933333]
     flip_margin: 0.02              # log-only: the gap must cross to beyond ±this for a flip to count
@@ -79,8 +79,12 @@ strategies:
     trend_skip_three_windows: 0    # skip if price at the decision is this far from the open 3 windows back; 0 = off
     calm_skip_pct: 0               # skip unless price stayed within ±this % of the open N windows back during those N windows; 0 = off (replaced by sideways:, was 0.5)
     calm_skip_windows: 3
-    sideways:                      # dual only inside a sideways session, from Binance 1m candles at the decision point (logged every window)
-      enabled: true
+    target_session:                # dual only inside a session: starts after 2 windows in a row each closed within tight_close of their
+      enabled: true                #   open (target = open of the first); ends at the first window closing further out, or once price at
+      tight_close: 0.08            #   the decision is more than band from the target. Then waits for 2 new tight closes. Logged every window
+      band: 0.20                   #   (replay 11:00 left, gap <= 0.07: 44 windows 47.7% +15.28; 10:00 + band 0.15: 39 windows 46.2% +9.92)
+    sideways:                      # log-only now (target_session decides): sideways measures from Binance 1m candles at the decision point
+      enabled: false
       box_1h_max_pct: 0.7          # last 60 min highest high - lowest low, % of price
       er_1h_max: 0.15              # last 60 min |net move| / total distance travelled (0 = going nowhere)
       atr_ratio_min: 0.7           # avg 1m candle range last hour / last 4 hours: below = market going dead
@@ -111,7 +115,8 @@ strategies:
       # when
       skip_new_york_hours: ""      # skip if the decision point is in this New York clock range; "" = every hour (trial); "12:00-05:00" = 10am-5pm UTC+1
       all_windows: true            # also windows the dual would have entered (skip reason dual_slot); false = only moved / not_calm / trend / too_cheap skips. Replay 10-5: -56.66 on 103 tr
-      recheck_until_seconds: 360   # filters fail at 10:00 left: keep checking every tick until this many seconds left; 0 = 10:00 only
+      first_check_seconds: 600     # first ds check at 10:00 left even though the dual decides at 11:00; 0 = at the dual's decision
+      recheck_until_seconds: 360   # filters fail at the first check: keep checking every tick until this many seconds left
       # entry
       min_gap: 0.12                # |PM gap| at least this and pointing to the favourite
       max_entry_cents: 90          # don't buy the favourite above this

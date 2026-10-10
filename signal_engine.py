@@ -130,6 +130,10 @@ FLAT_DUAL_TRADES_HEADER = [
     "sideways_er1h",
     "sideways_atr_ratio",
     "sideways_on",
+    "session_prev_close_moves",
+    "session_target",
+    "session_drift",
+    "session_on",
     "max_move",
     "limit_cents",
     "up_ask_at_entry",
@@ -263,7 +267,7 @@ DELTA_SIDE_TRADES_HEADER = [
 ]
 
 # Dual skip reasons that open a delta-side trade (the window is in trading hours but not calm/flat enough for a dual).
-DELTA_SIDE_SKIP_PREFIXES = ("moved", "not_calm", "trend", "too_cheap", "not_sideways", "sideways_warmup")
+DELTA_SIDE_SKIP_PREFIXES = ("moved", "not_calm", "trend", "too_cheap", "not_sideways", "sideways_warmup", "no_session", "session_warmup")
 
 
 def apply_duration_paths(config: dict[str, Any], coin: str, duration_minutes: int) -> dict[str, Any]:
@@ -2359,6 +2363,11 @@ class FlatDualSimulator:
         self.sideways_atr_min = float(sideways.get("atr_ratio_min", 0.7))
         self.sideways_atr_max = float(sideways.get("atr_ratio_max", 1.1))
         self.sideways_min_minutes = int(sideways.get("min_minutes", 230))
+        session = cfg.get("target_session") if isinstance(cfg.get("target_session"), dict) else {}
+        self.session_enabled = bool(session.get("enabled", False))
+        self.session_tight = float(session.get("tight_close", 0.08))
+        self.session_band = float(session.get("band", 0.20))
+        self._session_target: float | None = None
         self.candles = MinuteCandles()
         if sideways and sideways.get("seed_from_binance", True):
             symbol = str(sideways.get("binance_symbol", "SOLUSDT"))
@@ -2397,6 +2406,7 @@ class FlatDualSimulator:
         self.delta_side_recheck_until = float(cfg.get("delta_side_recheck_until_seconds", 0))
         self.delta_side_all_windows = bool(cfg.get("delta_side_all_windows", False))
         self.delta_side_max_loss_pct = float(cfg.get("delta_side_max_loss_pct", 0)) / 100.0
+        self.delta_side_first_check = float(cfg.get("delta_side_first_check_seconds", 0))
         self._delta_open: dict[int, dict[str, Any]] = {}
         self._delta_pending: dict[int, str] = {}
         self.delta_equity, self.delta_capital_source = starting_capital(
@@ -2571,6 +2581,37 @@ class FlatDualSimulator:
         if not self.sideways_enabled or m["on"]:
             return ""
         return f"not_sideways box1h={m['box1h']:.2f}% er={m['er1h']:.2f} atr={m['atr_ratio']:.2f}"
+
+    def _target_session_reason(self, window_start: int, current_price: float) -> str:
+        """Dual session: starts after 2 windows in a row closed within session_tight of their open (target = open of
+        the first), ends at the first window that closes further out or once price is more than session_band from
+        the target. A window's close is the next window's price to beat. "" to trade."""
+        vol = self._volatility.setdefault(window_start, {})
+        prev1, prev2 = window_start - self.duration_seconds, window_start - 2 * self.duration_seconds
+        o0, o1, o2 = self._opens.get(window_start), self._opens.get(prev1), self._opens.get(prev2)
+        if not (o0 and o1 and o2):
+            self._session_target = None
+            vol["session_on"] = ""
+            return "session_warmup" if self.session_enabled else ""
+        move1, move2 = o0 - o1, o1 - o2
+        vol.update({"session_prev_close_moves": f"{move2:+.2f}/{move1:+.2f}"})
+        reason = ""
+        if abs(move1) > self.session_tight + 1e-9:
+            self._session_target = None
+            reason = f"no_session last window closed {move1:+.2f}"
+        elif self._session_target is None:
+            if abs(move2) <= self.session_tight + 1e-9:
+                self._session_target = o2
+            else:
+                reason = f"no_session waiting 2 tight closes {move2:+.2f}/{move1:+.2f}"
+        if self._session_target is not None:
+            drift = current_price - self._session_target
+            vol.update({"session_target": round(self._session_target, 2), "session_drift": round(drift, 2)})
+            if abs(drift) > self.session_band + 1e-9:
+                reason = f"no_session drift {drift:+.2f} from {self._session_target:.2f}"
+                self._session_target = None
+        vol["session_on"] = int(not reason)
+        return reason if self.session_enabled else ""
 
     def _new_york_hours_skip_reason(self, window_start: int, hours: tuple[int, int] | None | str = "dual") -> str:
         """Skip reason when the decision point falls in the configured New York clock range; "" to trade."""
@@ -2749,6 +2790,8 @@ class FlatDualSimulator:
         Only when the PM delta is at least delta_side_min_gap and points to that same side.
         """
         if not self.delta_side_enabled or window_start in self._delta_open:
+            return
+        if self.delta_side_first_check > 0 and remaining > self.delta_side_first_check:
             return
         if self._new_york_hours_skip_reason(window_start, self.delta_side_skip_new_york_hours):
             return
@@ -2930,6 +2973,8 @@ class FlatDualSimulator:
         gap = round(current_price - price_to_beat, 2)
         self._record_volatility(window_start, current_price - price_to_beat, remaining, up_ask, down_ask)
         sideways_reason = self._sideways_skip_reason(window_start)
+        session_reason = self._target_session_reason(window_start, current_price)
+        sideways_reason = sideways_reason or session_reason
         daily_reason = "" if self._new_york_hours_skip_reason(window_start) else self._daily_target_reason(window_start)
         if daily_reason:
             self._log_skip(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, daily_reason)

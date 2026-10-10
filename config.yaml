@@ -98,6 +98,7 @@ strategies:
     delta_side_stop_cents: 30      # fixed mode: sell at the bid once it falls to this (cancels the take-profit); 0 = no stop
     delta_side_stop_wait_seconds: 120  # only sell if the bid stays at/below the stop this long; coming back above resets it
     delta_side_stop_floor_cents: 50    # planned mode: the stop is never set below this
+    delta_side_recheck_until_seconds: 360  # filters fail at 10:00 left: keep checking them until 6:00 left (0 = decision only)
     delta_side_contracts: 8
     delta_side_capital: 100.0      # separate running balance; on restart: --ds-last, else last row of its log, else this
     daily_profit_stop_usd: 10      # once the day's realised profit (dual + delta side) reaches this, no new trades until tomorrow; 0 = off

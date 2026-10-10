@@ -2308,7 +2308,9 @@ class FlatDualSimulator:
         self.delta_side_stop_wait = float(cfg.get("delta_side_stop_wait_seconds", 0))
         self.delta_side_stop_floor = float(cfg.get("delta_side_stop_floor_cents", 0)) / 100.0
         self.delta_log_file = str(cfg.get("delta_side_log_file") or delta_side_trades_path(self.coin, self.duration_minutes))
+        self.delta_side_recheck_until = float(cfg.get("delta_side_recheck_until_seconds", 0))
         self._delta_open: dict[int, dict[str, Any]] = {}
+        self._delta_pending: dict[int, str] = {}
         self.delta_equity, self.delta_capital_source = starting_capital(
             cfg, "delta_side_capital", "delta_side_capital_restored", self.delta_log_file
         )
@@ -2538,6 +2540,20 @@ class FlatDualSimulator:
         self._print_event(f"➖ [flat_dual] no entry | {reason} | {self._slug(window_start)}")
         if reason.startswith(DELTA_SIDE_SKIP_PREFIXES):
             self._open_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason)
+            if window_start not in self._delta_open and self.delta_side_recheck_until > 0:
+                self._delta_pending[window_start] = reason
+
+    def _recheck_delta_side(
+        self, window_start: int, remaining: float, price_to_beat: float, current_price: float, up_ask: float, down_ask: float
+    ) -> None:
+        """Dual-skipped window where the delta-side filters failed at the decision: keep checking until the cutoff."""
+        reason = self._delta_pending.get(window_start)
+        if reason is None:
+            return
+        if window_start in self._delta_open or remaining < self.delta_side_recheck_until:
+            self._delta_pending.pop(window_start, None)
+            return
+        self._open_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, reason)
 
     def _trading_day(self, window_start: int) -> Any:
         """New York date of the decision point; the whole 10am-5pm session falls on one."""
@@ -2598,6 +2614,8 @@ class FlatDualSimulator:
         """
         if not self.delta_side_enabled or window_start in self._delta_open or self._new_york_hours_skip_reason(window_start):
             return
+        if self._daily_target_reason(window_start):
+            return
         if current_price <= 0 or price_to_beat <= 0 or up_ask == down_ask:
             return
         gap = round(current_price - price_to_beat, 2)
@@ -2636,7 +2654,7 @@ class FlatDualSimulator:
             "mode": self.mode,
         }
         self._print_event(
-            f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} | stop {stop_price*100:.0f}¢"
+            f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} at {_format_mmss(remaining)} left | stop {stop_price*100:.0f}¢"
             f"{f' after {self.delta_side_stop_wait:.0f}s' if self.delta_side_stop_wait else ''} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
         )
 
@@ -2686,6 +2704,7 @@ class FlatDualSimulator:
     def _settle_delta_side(self, window_start: int, outcome: str, final_price: float) -> None:
         trade = self._delta_open.pop(window_start, None)
         self._delta_open = {w: t for w, t in self._delta_open.items() if w > window_start}
+        self._delta_pending = {w: r for w, r in self._delta_pending.items() if w > window_start}
         if trade is None:
             return
         price, contracts, fee = trade["entry_price"], trade["contracts"], trade["taker_fee"]
@@ -3177,6 +3196,7 @@ class FlatDualSimulator:
             self._opens[window_start] = price_to_beat
         self._track_range(window_start, current_price, remaining_seconds)
         self._update_delta_side(window_start, remaining_seconds, up_ask, down_ask)
+        self._recheck_delta_side(window_start, remaining_seconds, price_to_beat, current_price, up_ask, down_ask)
         if volume_usd is not None:
             # Trades are only counted from subscription, so a late start undercounts the window.
             partial = volume_since is None or volume_since > window_start + 30

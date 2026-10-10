@@ -69,7 +69,7 @@ strategies:
     investable_per_trade: 5.0
     capital_mode: locked
     limit_cents: 30                # per-side price; a side already below this is bought at its ask
-    max_move: 0.15               # max |price - price_to_beat| at the decision point
+    max_move: 0.09               # max |price - price_to_beat| at the decision point (gap is in cents, so 0.09 = under 0.10)
     max_binance_move: 0.15       # max |binance - price_to_beat| at the decision point; ignored (pm_only) if no Binance price
     decision_fraction: 0.33334     # decide once this share of the window has elapsed (10:00 left on 15m)
     # log-only: Up/Down prices and gaps at these shares of the window; every minute from 14:00 to 01:00 left on 15m
@@ -77,13 +77,22 @@ strategies:
     flip_margin: 0.02              # log-only: the gap must cross to beyond ±this for a flip to count
     trend_skip_one_window: 0       # skip if price at the decision is this far from the previous window's open; 0 = off
     trend_skip_three_windows: 0    # skip if price at the decision is this far from the open 3 windows back; 0 = off
-    calm_skip_pct: 0.5             # skip unless price stayed within ±this % of the open N windows back during those N windows; 0 = off
+    calm_skip_pct: 0               # skip unless price stayed within ±this % of the open N windows back during those N windows; 0 = off (replaced by sideways:, was 0.5)
     calm_skip_windows: 3
+    sideways:                      # dual only inside a sideways session, from Binance 1m candles at the decision point (logged every window)
+      enabled: true
+      box_1h_max_pct: 0.7          # last 60 min highest high - lowest low, % of price
+      er_1h_max: 0.15              # last 60 min |net move| / total distance travelled (0 = going nowhere)
+      atr_ratio_min: 0.7           # avg 1m candle range last hour / last 4 hours: below = market going dead
+      atr_ratio_max: 1.1           #   above = volatility expanding
+      min_minutes: 230             # 1m candles needed out of the last 240 (seeded from Binance at start-up)
+      seed_from_binance: true
+      binance_symbol: SOLUSDT
     min_trades_before_decision: 0    # skip if fewer than this many trades in the window before the decision; 0 = off (still logged)
     min_volume_before_decision_usd: 0   # skip if less than this many $ traded in the window before the decision; 0 = off (still logged)
     skip_new_york_hours: ""             # dual: skip if the decision point is in this New York clock range ("12:00-05:00" = trade 10am-5pm UTC+1); "" = off. Off while the dual is log-only so ds sees every window's real skip reason
-    dual_new_york_hours: "00:00-00:00"  # dual only for windows starting in this New York range; "00:00-00:00" = never (dual log-only, delta side unaffected); "" = off
-    dual_weekdays_only: true            # no dual on Sat/Sun (New York date); delta side still trades
+    dual_new_york_hours: ""             # dual only for windows starting in this New York range; "00:00-00:00" = never (dual log-only, delta side unaffected); "" = every hour (tight-delta trial)
+    dual_weekdays_only: false           # true = no dual on Sat/Sun (New York date); delta side still trades
     decision_tolerance_seconds: 60 # give up if no price/asks within this long after the decision point
     cancel_remaining_seconds: 0    # cancel unfilled limits with this many seconds left; 0 = never
     cancel_move: 0                 # after entry, if no side has filled, cancel both limits once the PM or Binance gap exceeds this; 0 = never

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import sys
+import threading
 import time
+import urllib.request
 import zoneinfo
 from dataclasses import dataclass
 from datetime import datetime
@@ -123,6 +126,10 @@ FLAT_DUAL_TRADES_HEADER = [
     "last_min_move",
     "implied_vol",
     "vol_ratio",
+    "sideways_box1h_pct",
+    "sideways_er1h",
+    "sideways_atr_ratio",
+    "sideways_on",
     "max_move",
     "limit_cents",
     "up_ask_at_entry",
@@ -256,7 +263,7 @@ DELTA_SIDE_TRADES_HEADER = [
 ]
 
 # Dual skip reasons that open a delta-side trade (the window is in trading hours but not calm/flat enough for a dual).
-DELTA_SIDE_SKIP_PREFIXES = ("moved", "not_calm", "trend", "too_cheap")
+DELTA_SIDE_SKIP_PREFIXES = ("moved", "not_calm", "trend", "too_cheap", "not_sideways", "sideways_warmup")
 
 
 def apply_duration_paths(config: dict[str, Any], coin: str, duration_minutes: int) -> dict[str, Any]:
@@ -397,6 +404,56 @@ def _with_delta_side_block(cfg: dict[str, Any]) -> dict[str, Any]:
     renamed = {"enabled": "delta_side_on_skip"}
     flat = {renamed.get(k, f"delta_side_{k}"): v for k, v in block.items()}
     return {**flat, **cfg}
+
+
+class MinuteCandles:
+    """Binance 1m candles [open, high, low, close] keyed by minute start, built from live ticks and seeded from REST."""
+
+    KEEP_SECONDS = 6 * 3600
+
+    def __init__(self) -> None:
+        self._candles: dict[int, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def add(self, ts: float, price: float) -> None:
+        if price <= 0:
+            return
+        minute = int(ts) // 60 * 60
+        with self._lock:
+            c = self._candles.get(minute)
+            if c is None:
+                self._candles[minute] = [price, price, price, price]
+                cutoff = minute - self.KEEP_SECONDS
+                for m in [m for m in self._candles if m < cutoff]:
+                    del self._candles[m]
+            else:
+                c[1] = max(c[1], price)
+                c[2] = min(c[2], price)
+                c[3] = price
+
+    def seed(self, rows: list[tuple[int, float, float, float, float]]) -> None:
+        """Completed candles from the exchange; minutes already built from live ticks are kept."""
+        with self._lock:
+            for minute, o, h, l, c in rows:
+                self._candles.setdefault(int(minute), [o, h, l, c])
+
+    def seed_from_binance(self, symbol: str, minutes: int = 300) -> None:
+        for host in ("https://data-api.binance.vision", "https://api.binance.com"):
+            try:
+                url = f"{host}/api/v3/klines?symbol={symbol}&interval=1m&limit={minutes}"
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    data = json.load(resp)
+                now_ms = time.time() * 1000
+                self.seed([(k[0] // 1000, float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in data if k[6] < now_ms])
+                return
+            except Exception:
+                continue
+
+    def completed(self, now: float, minutes: int) -> list[list[float]]:
+        """Completed candles in the last ``minutes`` minutes before the current minute, oldest first."""
+        current = int(now) // 60 * 60
+        with self._lock:
+            return [list(self._candles[m]) for m in range(current - minutes * 60, current, 60) if m in self._candles]
 
 
 def _stdev(values: list[float]) -> float | None:
@@ -2295,6 +2352,17 @@ class FlatDualSimulator:
         )
         self.dual_new_york_hours = _parse_clock_range(cfg.get("dual_new_york_hours"))
         self.dual_weekdays_only = bool(cfg.get("dual_weekdays_only", False))
+        sideways = cfg.get("sideways") if isinstance(cfg.get("sideways"), dict) else {}
+        self.sideways_enabled = bool(sideways.get("enabled", False))
+        self.sideways_box_max = float(sideways.get("box_1h_max_pct", 0.7))
+        self.sideways_er_max = float(sideways.get("er_1h_max", 0.15))
+        self.sideways_atr_min = float(sideways.get("atr_ratio_min", 0.7))
+        self.sideways_atr_max = float(sideways.get("atr_ratio_max", 1.1))
+        self.sideways_min_minutes = int(sideways.get("min_minutes", 230))
+        self.candles = MinuteCandles()
+        if sideways and sideways.get("seed_from_binance", True):
+            symbol = str(sideways.get("binance_symbol", "SOLUSDT"))
+            threading.Thread(target=self.candles.seed_from_binance, args=(symbol,), daemon=True).start()
         self.early_check_remaining = [
             self.duration_seconds * (1.0 - float(f)) for f in (cfg.get("early_check_fractions") or [])
         ]
@@ -2469,6 +2537,40 @@ class FlatDualSimulator:
         if up < self.calm_skip_pct and -down < self.calm_skip_pct:
             return ""
         return f"not_calm {n}w up={up:+.2f}% down={down:+.2f}%"
+
+    def _sideways_metrics(self, now: float) -> dict[str, Any] | None:
+        """1h box %, 1h efficiency ratio and 1h/4h average candle range from the last 4 hours of 1m candles; None until warm."""
+        c4 = self.candles.completed(now, 240)
+        c1 = self.candles.completed(now, 60)
+        if len(c4) < self.sideways_min_minutes or len(c1) < 50:
+            return None
+        px = c1[-1][3]
+        closes = [c[3] for c in c1]
+        path = sum(abs(b - a) for a, b in zip(closes, closes[1:]))
+        atr4 = sum(c[1] - c[2] for c in c4) / len(c4)
+        box = (max(c[1] for c in c1) - min(c[2] for c in c1)) / px * 100
+        er = abs(closes[-1] - closes[0]) / path if path else 0.0
+        atr_ratio = (sum(c[1] - c[2] for c in c1) / len(c1)) / atr4 if atr4 else 0.0
+        on = box <= self.sideways_box_max and er <= self.sideways_er_max and self.sideways_atr_min <= atr_ratio <= self.sideways_atr_max
+        return {"box1h": box, "er1h": er, "atr_ratio": atr_ratio, "on": on}
+
+    def _sideways_skip_reason(self, window_start: int) -> str:
+        """Dual only inside a sideways session; also logs the measures for every decided window. "" to trade."""
+        m = self._sideways_metrics(time.time())
+        vol = self._volatility.setdefault(window_start, {})
+        if m is None:
+            vol["sideways_on"] = ""
+            n = len(self.candles.completed(time.time(), 240))
+            return f"sideways_warmup {n}/240m" if self.sideways_enabled else ""
+        vol.update({
+            "sideways_box1h_pct": round(m["box1h"], 3),
+            "sideways_er1h": round(m["er1h"], 3),
+            "sideways_atr_ratio": round(m["atr_ratio"], 2),
+            "sideways_on": int(m["on"]),
+        })
+        if not self.sideways_enabled or m["on"]:
+            return ""
+        return f"not_sideways box1h={m['box1h']:.2f}% er={m['er1h']:.2f} atr={m['atr_ratio']:.2f}"
 
     def _new_york_hours_skip_reason(self, window_start: int, hours: tuple[int, int] | None | str = "dual") -> str:
         """Skip reason when the decision point falls in the configured New York clock range; "" to trade."""
@@ -2827,6 +2929,7 @@ class FlatDualSimulator:
         self._decided_windows.add(window_start)
         gap = round(current_price - price_to_beat, 2)
         self._record_volatility(window_start, current_price - price_to_beat, remaining, up_ask, down_ask)
+        sideways_reason = self._sideways_skip_reason(window_start)
         daily_reason = "" if self._new_york_hours_skip_reason(window_start) else self._daily_target_reason(window_start)
         if daily_reason:
             self._log_skip(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, daily_reason)
@@ -2846,7 +2949,9 @@ class FlatDualSimulator:
             )
             return
 
-        trend_reason = self._trend_skip_reason(window_start, current_price) or self._calm_skip_reason(window_start)
+        trend_reason = (
+            self._trend_skip_reason(window_start, current_price) or self._calm_skip_reason(window_start) or sideways_reason
+        )
         if trend_reason:
             self._log_skip(
                 window_start, remaining, price_to_beat, current_price, up_ask, down_ask, trend_reason
@@ -3242,6 +3347,7 @@ class FlatDualSimulator:
     ) -> None:
         self._binance_price = binance_price
         self._binance_price_to_beat = binance_price_to_beat
+        self.candles.add(time.time(), binance_price)
         self._first_seen.setdefault(window_start, remaining_seconds)
         if price_to_beat > 0:
             self._opens[window_start] = price_to_beat

@@ -2397,6 +2397,7 @@ class FlatDualSimulator:
         self.delta_side_contracts = int(cfg.get("delta_side_contracts", 8))
         self.delta_side_min_gap = float(cfg.get("delta_side_min_gap", 0.15))
         self.delta_side_max_entry = float(cfg.get("delta_side_max_entry_cents", 99)) / 100.0
+        self.delta_side_min_entry = float(cfg.get("delta_side_min_entry_cents", 0)) / 100.0
         self.delta_side_take_profit = float(cfg.get("delta_side_take_profit_cents", 0)) / 100.0
         self.delta_side_stop = float(cfg.get("delta_side_stop_cents", 0)) / 100.0
         self.delta_side_stop_mode = str(cfg.get("delta_side_stop_mode", "fixed")).strip().lower()
@@ -2805,6 +2806,8 @@ class FlatDualSimulator:
             return
         price = up_ask if side == "Up" else down_ask
         if not 0.01 < price < 0.99 or price > self.delta_side_max_entry + 1e-9:
+            return
+        if price < self.delta_side_min_entry - 1e-9:
             return
         contracts = self.delta_side_contracts
         fee = contracts * self.taker_fee_rate * price * (1.0 - price)
@@ -3622,7 +3625,7 @@ class StrategyRunner:
                 if s.delta_side_enabled:
                     lines.append(
                         f"  delta_side: capital=${s.delta_equity:.2f} (from {s.delta_capital_source}) "
-                        f"max_entry={s.delta_side_max_entry*100:.0f}¢ trades={s.delta_log_file}"
+                        f"entry={s.delta_side_min_entry*100:.0f}-{s.delta_side_max_entry*100:.0f}¢ trades={s.delta_log_file}"
                     )
             else:
                 lines.append(f"  {type(s).__name__}")

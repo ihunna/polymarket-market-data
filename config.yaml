@@ -119,6 +119,7 @@ strategies:
       recheck_until_seconds: 360   # filters fail at the first check: keep checking every tick until this many seconds left
       # entry
       min_gap: 0.12                # |PM gap| at least this and pointing to the favourite
+      min_entry_cents: 81          # don't buy the favourite below this. Replay 10:00 entry, held: 71-80c 70.8% win -48.90, 81-90c 90.9% +58.80
       max_entry_cents: 90          # don't buy the favourite above this
       # exit
       take_profit_cents: 99        # resting sell (no fee), fills when our bid (1 - other side's ask) reaches this; 0 = hold to the end

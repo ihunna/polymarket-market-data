@@ -2408,6 +2408,12 @@ class FlatDualSimulator:
         self.delta_side_all_windows = bool(cfg.get("delta_side_all_windows", False))
         self.delta_side_max_loss_pct = float(cfg.get("delta_side_max_loss_pct", 0)) / 100.0
         self.delta_side_first_check = float(cfg.get("delta_side_first_check_seconds", 0))
+        self.delta_side_trigger = str(cfg.get("delta_side_trigger", "gap")).strip().lower()
+        self.delta_side_disagree_min_gap = float(cfg.get("delta_side_disagree_min_gap", 0.05))
+        start = float(cfg.get("delta_side_disagree_from_seconds", 840))
+        end = float(cfg.get("delta_side_disagree_until_seconds", 420))
+        self.delta_side_disagree_marks = [start - 60 * i for i in range(int((start - end) // 60) + 1)]
+        self._delta_marks_done: dict[int, set[float]] = {}
         self._delta_open: dict[int, dict[str, Any]] = {}
         self._delta_pending: dict[int, str] = {}
         self.delta_equity, self.delta_capital_source = starting_capital(
@@ -2790,13 +2796,9 @@ class FlatDualSimulator:
 
         Only when the PM delta is at least delta_side_min_gap and points to that same side.
         """
-        if not self.delta_side_enabled or window_start in self._delta_open:
+        if self.delta_side_trigger != "gap" or self._delta_side_blocked(window_start):
             return
         if self.delta_side_first_check > 0 and remaining > self.delta_side_first_check:
-            return
-        if self._new_york_hours_skip_reason(window_start, self.delta_side_skip_new_york_hours):
-            return
-        if self._daily_target_reason(window_start):
             return
         if current_price <= 0 or price_to_beat <= 0 or up_ask == down_ask:
             return
@@ -2809,6 +2811,56 @@ class FlatDualSimulator:
             return
         if price < self.delta_side_min_entry - 1e-9:
             return
+        self._enter_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, side, price, gap, reason)
+
+    def _delta_side_blocked(self, window_start: int) -> bool:
+        if not self.delta_side_enabled or window_start in self._delta_open:
+            return True
+        if self._new_york_hours_skip_reason(window_start, self.delta_side_skip_new_york_hours):
+            return True
+        return bool(self._daily_target_reason(window_start))
+
+    def _check_delta_disagreement(
+        self, window_start: int, remaining: float, price_to_beat: float, current_price: float, up_ask: float, down_ask: float
+    ) -> None:
+        """Disagreement trigger: once a minute from 14:00 to 07:00 left, PM and Binance gaps point opposite ways
+        (each at least disagree_min_gap) -> buy the market favourite. Runs on every window, whatever the dual did."""
+        if self.delta_side_trigger != "disagreement":
+            return
+        done = self._delta_marks_done.setdefault(window_start, set())
+        due = [m for m in self.delta_side_disagree_marks if remaining <= m and m not in done]
+        if not due:
+            return
+        done.update(due)
+        if remaining < min(due) - self.decision_tolerance_seconds or self._delta_side_blocked(window_start):
+            return
+        bgap = self._binance_gap_value()
+        if current_price <= 0 or price_to_beat <= 0 or bgap is None or up_ask == down_ask:
+            return
+        gap = round(current_price - price_to_beat, 2)
+        size = self.delta_side_disagree_min_gap - 1e-9
+        if abs(gap) < size or abs(bgap) < size or (gap > 0) == (bgap > 0):
+            return
+        side = "Up" if up_ask > down_ask else "Down"
+        price = up_ask if side == "Up" else down_ask
+        if not 0.01 < price < 0.99:
+            return
+        reason = f"disagreement pm={gap:+.2f} binance={bgap:+.2f}"
+        self._enter_delta_side(window_start, remaining, price_to_beat, current_price, up_ask, down_ask, side, price, gap, reason)
+
+    def _enter_delta_side(
+        self,
+        window_start: int,
+        remaining: float,
+        price_to_beat: float,
+        current_price: float,
+        up_ask: float,
+        down_ask: float,
+        side: str,
+        price: float,
+        gap: float,
+        reason: str,
+    ) -> None:
         contracts = self.delta_side_contracts
         fee = contracts * self.taker_fee_rate * price * (1.0 - price)
         if self.delta_side_stop_mode == "planned":
@@ -2842,7 +2894,8 @@ class FlatDualSimulator:
         self._print_event(
             f"🎯 [delta_side] bought {side} @ {price*100:.0f}¢ x{contracts} at {_format_mmss(remaining)} left | stop {stop_price*100:.0f}¢"
             f"{f' after {self.delta_side_stop_wait:.0f}s' if self.delta_side_stop_wait else ''}"
-            f"{f' | max loss at {max_loss_price*100:.0f}¢' if max_loss_price else ''} | gap={gap:+.2f} | dual skipped: {reason} | {self._slug(window_start)}"
+            f"{f' | max loss at {max_loss_price*100:.0f}¢' if max_loss_price else ''} | gap={gap:+.2f} | "
+            f"{'' if self.delta_side_trigger == 'disagreement' else 'dual skipped: '}{reason} | {self._slug(window_start)}"
         )
 
     def _update_delta_side(self, window_start: int, remaining: float, up_ask: float, down_ask: float) -> None:
@@ -2897,6 +2950,7 @@ class FlatDualSimulator:
         trade = self._delta_open.pop(window_start, None)
         self._delta_open = {w: t for w, t in self._delta_open.items() if w > window_start}
         self._delta_pending = {w: r for w, r in self._delta_pending.items() if w > window_start}
+        self._delta_marks_done = {w: m for w, m in self._delta_marks_done.items() if w > window_start}
         if trade is None:
             return
         price, contracts, fee = trade["entry_price"], trade["contracts"], trade["taker_fee"]
@@ -3402,6 +3456,7 @@ class FlatDualSimulator:
         self._track_range(window_start, current_price, remaining_seconds)
         self._update_delta_side(window_start, remaining_seconds, up_ask, down_ask)
         self._recheck_delta_side(window_start, remaining_seconds, price_to_beat, current_price, up_ask, down_ask)
+        self._check_delta_disagreement(window_start, remaining_seconds, price_to_beat, current_price, up_ask, down_ask)
         if volume_usd is not None:
             # Trades are only counted from subscription, so a late start undercounts the window.
             partial = volume_since is None or volume_since > window_start + 30
@@ -3625,7 +3680,10 @@ class StrategyRunner:
                 if s.delta_side_enabled:
                     lines.append(
                         f"  delta_side: capital=${s.delta_equity:.2f} (from {s.delta_capital_source}) "
-                        f"entry={s.delta_side_min_entry*100:.0f}-{s.delta_side_max_entry*100:.0f}¢ trades={s.delta_log_file}"
+                        + (f"trigger=disagreement both gaps>={s.delta_side_disagree_min_gap:.2f} opposite "
+                           if s.delta_side_trigger == "disagreement"
+                           else f"entry={s.delta_side_min_entry*100:.0f}-{s.delta_side_max_entry*100:.0f}¢ ")
+                        + f"trades={s.delta_log_file}"
                     )
             else:
                 lines.append(f"  {type(s).__name__}")
